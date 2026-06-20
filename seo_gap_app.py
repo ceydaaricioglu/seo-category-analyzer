@@ -129,6 +129,10 @@ def detect_platform(domain, progress_cb=None):
                     progress_cb(f"⚠️ Rate-limit (HTTP {r.status_code}) — {wait}s bekleniyor, deneme {attempt+1}/4...")
                 time.sleep(wait)
                 continue
+            if r.status_code == 404:
+                if progress_cb:
+                    progress_cb("Shopify API bulunamadı (404) — site Shopify değil, genel tarama kullanılacak.")
+                return "generic"
             if progress_cb:
                 progress_cb(f"⚠️ Platform tespiti HTTP {r.status_code} döndü.")
             return "generic"
@@ -434,7 +438,7 @@ def estimate_site_size(domain, progress_cb=None):
 def scrape_page_title_and_count(url, progress_cb=None):
     """Bir kategori sayfasını ziyaret edip başlık + ürün sayısını (sayfadaki metinden) çıkarır."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
+        r = requests.get(url, headers=HEADERS, timeout=8)
         if r.status_code != 200:
             return None
         soup = BeautifulSoup(r.text, "html.parser")
@@ -457,7 +461,7 @@ def scrape_page_title_and_count(url, progress_cb=None):
 def scrape_product_title(url):
     """Bir ürün sayfasını ziyaret edip sadece başlığını çeker (hızlı, minimal parse)."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=12)
+        r = requests.get(url, headers=HEADERS, timeout=8)
         if r.status_code != 200:
             return None
         soup = BeautifulSoup(r.text, "html.parser")
@@ -479,7 +483,7 @@ def fetch_generic_categories(domain, category_urls, progress_cb=None, max_catego
             categories.append(info)
         if progress_cb and i % 10 == 0:
             progress_cb(f"Kategori sayfaları taranıyor... ({i+1}/{min(len(category_urls), max_categories)})")
-        time.sleep(0.3)
+        time.sleep(0.15)
     return categories
 
 
@@ -1247,13 +1251,14 @@ if disc and disc.get("platform") == "generic" and "crawl_mode" not in disc:
     p_count = size_info["product_count"]
     c_count = size_info["category_count"]
 
-    est_full_minutes = round((p_count * 0.5) / 60) or 1     # ~0.5s/ürün tahmini
-    est_search_minutes = 2   # gap'ler belirlendikten sonra sadece o kelimeler aranır, hızlı
+    est_cat_minutes  = round((min(c_count, 150) * 0.6) / 60, 1) or 0.1   # kategori taraması her iki modda da çalışır
+    est_full_minutes = round(est_cat_minutes + (p_count * 0.5) / 60)
+    est_search_minutes = round(est_cat_minutes + 1)   # gap'ler belirlendikten sonra sadece o kelimeler aranır
 
     st.markdown(f"""
     <div class="warn-box" style="background:#eaf1fd;border-color:#bcd4f5;color:#2a4d7a">
         Sitemap'te yaklaşık <b>{c_count} kategori</b> ve <b>{p_count:,} ürün</b> URL'si bulundu.
-        Nasıl ilerleyelim?
+        {"İlk 150 kategori taranacak. " if c_count > 150 else ""}Nasıl ilerleyelim?
     </div>
     """, unsafe_allow_html=True)
 
