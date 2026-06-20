@@ -323,6 +323,47 @@ CATEGORY_URL_HINTS = ["/kategori", "/category", "/categories", "/collections",
                        "/urunler", "/urun-listesi", "/c/", "/cat/", "/shop/", "/koleksiyon"]
 PRODUCT_URL_HINTS  = ["/urun/", "/product/", "/p/", "/products/", "/detay/", "/dp/"]
 
+# Ürün URL'lerinin sonunda genelde bir sayısal/alfanumerik ID bulunur — örn.
+# "...-p-123456", "...-12345.html", "...?pid=123". Bu, platform bağımsız çok
+# güçlü bir "bu bir ürün sayfası" sinyalidir.
+PRODUCT_ID_SUFFIX_RE = re.compile(r'[-_](p-?)?\d{4,}(\.html?)?/?$', re.IGNORECASE)
+# Kategori sayfaları genelde URL'in son segmentinde sayı taşımaz, kelime taşır.
+CATEGORY_WORDY_END_RE = re.compile(r'/[a-zçğıöşü\-]+/?$', re.IGNORECASE)
+
+
+def classify_sitemap_urls(urls):
+    """
+    URL'leri kategori / ürün / diğer olarak ayırır. Öncelik sırası:
+    1. URL sonunda sayısal ID var mı? (en güçlü ürün sinyali, platform bağımsız)
+    2. Path'te bilinen ürün hint'i var mı?
+    3. Path'te bilinen kategori hint'i var mı?
+    4. Hiçbiri yoksa: path derinliğine bak (genelde ürünler daha derin nestlenir)
+    """
+    category_urls, product_urls, other_urls = [], [], []
+    for u in urls:
+        path = urlparse(u).path.lower()
+        segments = [s for s in path.split("/") if s]
+
+        has_product_hint  = any(h in path for h in PRODUCT_URL_HINTS)
+        has_category_hint = any(h in path for h in CATEGORY_URL_HINTS)
+        has_numeric_id     = bool(PRODUCT_ID_SUFFIX_RE.search(path))
+
+        if has_numeric_id:
+            product_urls.append(u)
+        elif has_product_hint and not has_category_hint:
+            product_urls.append(u)
+        elif has_category_hint and not has_numeric_id:
+            category_urls.append(u)
+        elif len(segments) >= 3:
+            # Derin path (3+ segment) ve hiçbir hint yok — büyük olasılıkla ürün detay sayfası
+            product_urls.append(u)
+        elif len(segments) in (1, 2):
+            # Sığ path (1-2 segment), hint yok — büyük olasılıkla kategori/koleksiyon sayfası
+            category_urls.append(u)
+        else:
+            other_urls.append(u)
+    return category_urls, product_urls, other_urls
+
 
 def discover_sitemaps(domain, progress_cb=None):
     candidates = [f"https://{domain}/sitemap.xml", f"https://{domain}/sitemap_index.xml"]
@@ -363,20 +404,6 @@ def parse_sitemap_urls(sitemap_url, progress_cb=None, _depth=0):
         if progress_cb:
             progress_cb(f"⚠️ Sitemap parse hatası ({sitemap_url}): {e}")
     return urls
-
-
-def classify_sitemap_urls(urls):
-    """URL'leri kategori / ürün / diğer olarak ayırır (path pattern heuristiği ile)."""
-    category_urls, product_urls, other_urls = [], [], []
-    for u in urls:
-        path = urlparse(u).path.lower()
-        if any(h in path for h in CATEGORY_URL_HINTS):
-            category_urls.append(u)
-        elif any(h in path for h in PRODUCT_URL_HINTS):
-            product_urls.append(u)
-        else:
-            other_urls.append(u)
-    return category_urls, product_urls, other_urls
 
 
 def estimate_site_size(domain, progress_cb=None):
