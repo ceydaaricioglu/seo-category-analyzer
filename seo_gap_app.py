@@ -141,12 +141,28 @@ def fetch_all_collections(domain, progress_cb=None):
 
 def fetch_all_products(domain, progress_cb=None, max_pages=200):
     products, page = [], 1
+    consecutive_errors = 0
     while page <= max_pages:
         try:
             r = requests.get(f"https://{domain}/products.json?limit=250&page={page}", headers=HEADERS, timeout=20)
+            if r.status_code != 200:
+                consecutive_errors += 1
+                if progress_cb and consecutive_errors == 1:
+                    progress_cb(f"⚠️ /products.json HTTP {r.status_code} döndü (sayfa {page}).")
+                if consecutive_errors >= 3:
+                    break
+                page += 1
+                continue
             items = r.json().get("products", [])
-        except Exception:
-            break
+        except Exception as e:
+            consecutive_errors += 1
+            if progress_cb and consecutive_errors == 1:
+                progress_cb(f"⚠️ Ürün çekme hatası: {e}")
+            if consecutive_errors >= 3:
+                break
+            page += 1
+            continue
+        consecutive_errors = 0
         if not items:
             break
         for p in items:
@@ -154,12 +170,14 @@ def fetch_all_products(domain, progress_cb=None, max_pages=200):
                 "title": p.get("title", ""),
                 "handle": p.get("handle", ""),
             })
-        if progress_cb:
-            progress_cb(f"Ürünler çekiliyor... ({len(products)} ürün)")
+        if progress_cb and page % 4 == 0:
+            progress_cb(f"Ürünler çekiliyor... ({len(products)} ürün, sayfa {page})")
         if len(items) < 250:
             break
         page += 1
         time.sleep(0.15)
+    if progress_cb:
+        progress_cb(f"Toplam {len(products)} ürün çekildi.")
     return products
 
 
@@ -183,15 +201,31 @@ def build_categories(collections, progress_cb=None):
 
 
 def fetch_category_product_counts(domain, categories, progress_cb=None):
+    """Her gerçek kategori için TAM ürün sayısını sayfalayarak çeker (250 üst sınırı yok)."""
+    errors = 0
     for i, cat in enumerate(categories):
+        total, page = 0, 1
         try:
-            r = requests.get(f"https://{domain}/collections/{cat['handle']}/products.json?limit=250", headers=HEADERS, timeout=15)
-            items = r.json().get("products", [])
-            cat["product_count"] = len(items)
+            while True:
+                r = requests.get(
+                    f"https://{domain}/collections/{cat['handle']}/products.json?limit=250&page={page}",
+                    headers=HEADERS, timeout=15
+                )
+                items = r.json().get("products", [])
+                total += len(items)
+                if len(items) < 250:
+                    break
+                page += 1
+                if page > 20:   # güvenlik limiti — 5000 ürünün üzerinde dur
+                    break
+            cat["product_count"] = total
         except Exception:
             cat["product_count"] = 0
-        if progress_cb and i % 20 == 0:
+            errors += 1
+        if progress_cb and i % 15 == 0:
             progress_cb(f"Kategori ürün sayıları hesaplanıyor... ({i+1}/{len(categories)})")
+    if progress_cb and errors:
+        progress_cb(f"⚠️ {errors} kategori için ürün sayısı çekilemedi.")
     return categories
 
 
@@ -306,34 +340,33 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None):
         progress_cb("Gap analizi yapılıyor...")
 
     matched, orphans = [], []
-    groups = defaultdict(lambda: {"keywords":[], "total_volume":0, "modifier":None, "base_cat":None})
+    groups = defaultdict(lambda: {"keywords": [], "total_volume": 0})
 
     for kw in keywords:
-        word, vol = kw.get("keyword",""), kw.get("search_volume",0)
+        word, vol = kw.get("keyword", ""), kw.get("search_volume", 0)
         if vol < 100:
             continue
         if any(_matches_category(word, c) for c in categories):
             matched.append(kw); continue
-        mod = next((t for t in _norm(word).split() if t in MODIFIERS), None)
-        if mod:
-            base = _norm(word).replace(mod,"").strip()[:30]
-            key  = f"{mod}__{base}"
-            groups[key]["keywords"].append(kw)
-            groups[key]["total_volume"] += vol
-            groups[key]["modifier"] = mod
-            groups[key]["base_cat"] = next((c["title"] for c in categories if _matches_category(base, c)), None)
-        else:
-            orphans.append(kw)
+
+        norm_word = _norm(word)
+        tokens = norm_word.split()
+        # Tek kelimelik, çok genel (marka/şehir/jenerik) terimleri ele — gap için en az 2 kelime istiyoruz
+        # ya da tek kelime ama bilinen bir modifier ise (örn. "sneakers") kabul et.
+        if len(tokens) < 2 and norm_word not in MODIFIERS:
+            orphans.append(kw); continue
+
+        key = norm_word
+        groups[key]["keywords"].append(kw)
+        groups[key]["total_volume"] += vol
 
     gaps = []
-    for group in groups.values():
+    for key, group in groups.items():
         if not group["keywords"]:
             continue
-        top   = max(group["keywords"], key=lambda x: x["search_volume"])
-        mod   = group["modifier"]
-        b_cat = group["base_cat"]
-        vol   = group["total_volume"]
-        label = f"{mod.title()} {_norm(top['keyword']).replace(mod,'').strip().title()}".strip()
+        top = max(group["keywords"], key=lambda x: x["search_volume"])
+        vol = group["total_volume"]
+        label = top["keyword"].title()
 
         query_tokens = _tokens(top["keyword"])
         real_product_count = count_matching_products(query_tokens, products)
@@ -346,16 +379,16 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None):
             status = "none"
 
         gaps.append({
-            "suggested_category":  label,
-            "modifier":            mod,
-            "base_category":       b_cat or "Belirsiz",
-            "keyword_count":       len(group["keywords"]),
-            "total_search_volume": vol,
-            "top_keyword":         top["keyword"],
-            "top_kw_volume":       top["search_volume"],
-            "matching_product_count": real_product_count,
-            "status":              status,
-            "sample_keywords":     ", ".join(k["keyword"] for k in sorted(
+            "suggested_category":     label,
+            "modifier":                next((t for t in query_tokens if t in MODIFIERS), ""),
+            "base_category":           "Belirsiz",
+            "keyword_count":           len(group["keywords"]),
+            "total_search_volume":     vol,
+            "top_keyword":             top["keyword"],
+            "top_kw_volume":           top["search_volume"],
+            "matching_product_count":  real_product_count,
+            "status":                  status,
+            "sample_keywords":         ", ".join(k["keyword"] for k in sorted(
                 group["keywords"], key=lambda x: x["search_volume"], reverse=True)[:5]),
         })
     gaps.sort(key=lambda x: x["total_search_volume"], reverse=True)
@@ -365,6 +398,32 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None):
 # ══════════════════════════════════════════════════════════════
 # 4. CHARTS
 # ══════════════════════════════════════════════════════════════
+
+def build_top_categories_table(categories, matched_keywords, limit=10):
+    """Mevcut kategorilere eşleşen keyword hacimlerini toplayıp en yüksek performanslı kategorileri sıralar."""
+    vol_by_cat = defaultdict(int)
+    kw_count_by_cat = defaultdict(int)
+    for kw in matched_keywords:
+        word = kw.get("keyword", "")
+        vol = kw.get("search_volume", 0)
+        for c in categories:
+            if _matches_category(word, c):
+                vol_by_cat[c["title"]] += vol
+                kw_count_by_cat[c["title"]] += 1
+                break
+    rows = []
+    for cat in categories:
+        title = cat["title"]
+        if vol_by_cat.get(title, 0) > 0:
+            rows.append({
+                "title": title,
+                "product_count": cat["product_count"] or 0,
+                "total_volume": vol_by_cat[title],
+                "keyword_count": kw_count_by_cat[title],
+            })
+    rows.sort(key=lambda r: r["total_volume"], reverse=True)
+    return rows[:limit]
+
 
 STATUS_LABEL = {"opportunity": "ÜRÜN VAR · SAYFA YOK", "high": "HACİM VAR · ÜRÜN YOK", "none": "DÜŞÜK ÖNCELİK"}
 STATUS_BADGE_CLASS = {"opportunity": "badge-opportunity", "high": "badge-high", "none": "badge-none"}
@@ -622,9 +681,35 @@ if st.session_state.results:
     else:
         st.info("Hiç gap önerisi bulunamadı.")
 
+    # ── En çok hacim getiren mevcut kategoriler ──
+    top_cats_table = build_top_categories_table(cats, r.get("matched", []))
+    st.markdown('<div class="section-title">En Çok Hacim Getiren Mevcut Kategoriler</div>', unsafe_allow_html=True)
+    if top_cats_table:
+        tc_html = "<div class='dtable'><div class='row head' style='grid-template-columns:2.5fr 1fr 1fr 1fr'>" \
+                  "<span>Kategori</span><span>Ürün Sayısı</span><span>Toplam Hacim</span><span>Eşleşen Keyword</span></div>"
+        for t in top_cats_table:
+            tc_html += (
+                f"<div class='row' style='grid-template-columns:2.5fr 1fr 1fr 1fr'>"
+                f"<span class='cat-name'>{t['title']}</span>"
+                f"<span class='mono'>{t['product_count']}</span>"
+                f"<span class='mono'>{t['total_volume']:,}</span>"
+                f"<span class='mono'>{t['keyword_count']}</span></div>"
+            )
+        tc_html += "</div>"
+        st.markdown(tc_html, unsafe_allow_html=True)
+    else:
+        st.info("Mevcut kategorilerle eşleşen keyword bulunamadı.")
+
+    # ── Filtrelenen kampanya/test koleksiyonları — grid görünüm ──
     if noise_cats:
-        with st.expander(f"Filtrelenen kampanya/test koleksiyonları ({len(noise_cats)})"):
-            st.write(", ".join(c["title"] for c in noise_cats[:100]))
+        st.markdown(f'<div class="section-title">Filtrelenen Kampanya / Test Koleksiyonları <span class="count">{len(noise_cats)}</span></div>', unsafe_allow_html=True)
+        with st.expander("Listeyi göster"):
+            chips = "".join(
+                f"<span style='display:inline-block;background:#eceef3;color:#4a4e5c;font-size:0.78rem;"
+                f"padding:4px 11px;border-radius:14px;margin:3px'>{c['title']}</span>"
+                for c in noise_cats[:150]
+            )
+            st.markdown(f"<div>{chips}</div>", unsafe_allow_html=True)
 
     st.markdown("<div style='margin-top:20px'>", unsafe_allow_html=True)
     excel_buf = generate_excel(gaps, cats, noise_cats, kws, dom)
