@@ -339,14 +339,24 @@ def fetch_site_categories(domain, progress_cb=None):
 AUTH = (DFS_LOGIN, DFS_PASSWORD)
 BASE = "https://api.dataforseo.com/v3"
 
-def _dfs_post(endpoint, payload):
+def _dfs_post(endpoint, payload, progress_cb=None):
     try:
         r    = requests.post(f"{BASE}/{endpoint}", auth=AUTH, json=payload, timeout=60)
         data = r.json()
         if data.get("status_code") != 20000:
+            if progress_cb:
+                progress_cb(f"⚠️ DataForSEO hatası (üst seviye): {data.get('status_code')} {data.get('status_message')}")
+            return None
+        # Task seviyesinde de hata olabilir, üst seviye 20000 olsa bile
+        task = data.get("tasks", [{}])[0]
+        if task.get("status_code") != 20000:
+            if progress_cb:
+                progress_cb(f"⚠️ DataForSEO task hatası: {task.get('status_code')} {task.get('status_message')}")
             return None
         return data
-    except Exception:
+    except Exception as e:
+        if progress_cb:
+            progress_cb(f"⚠️ İstek hatası: {e}")
         return None
 
 def fetch_domain_keywords(domain, progress_cb=None):
@@ -355,12 +365,17 @@ def fetch_domain_keywords(domain, progress_cb=None):
     payload = [{"target": domain, "language_code": "tr", "location_code": 2792,
                 "limit": 2000, "filters": ["keyword_data.keyword_info.search_volume", ">", 0],
                 "order_by": ["keyword_data.keyword_info.search_volume,desc"]}]
-    data = _dfs_post("dataforseo_labs/google/ranked_keywords/live", payload)
+    data = _dfs_post("dataforseo_labs/google/ranked_keywords/live", payload, progress_cb)
     if not data:
         return []
     keywords = []
     try:
-        for item in data["tasks"][0]["result"][0]["items"]:
+        result = data["tasks"][0].get("result")
+        if not result or not result[0].get("items"):
+            if progress_cb:
+                progress_cb("⚠️ DataForSEO sonuç döndü ama içinde keyword yok (items boş).")
+            return []
+        for item in result[0]["items"]:
             kw   = item.get("keyword_data", {})
             info = kw.get("keyword_info", {})
             serp = item.get("ranked_serp_element", {}).get("serp_element", {})
@@ -369,8 +384,9 @@ def fetch_domain_keywords(domain, progress_cb=None):
                              "position": serp.get("rank_group",0), "url": serp.get("url","")})
         if progress_cb:
             progress_cb(f"{len(keywords)} keyword çekildi.")
-    except Exception:
-        pass
+    except Exception as e:
+        if progress_cb:
+            progress_cb(f"⚠️ Parse hatası: {e}")
     return keywords
 
 
@@ -644,9 +660,12 @@ if run_btn and domain_input:
     domain = domain_input.strip().replace("https://","").replace("http://","").strip("/")
     status = st.empty()
     prog   = st.progress(0)
+    log_lines = []
 
     def cb(msg):
-        status.markdown(f"<p style='color:#6b7080;font-size:0.85rem;margin:4px 0'>{msg}</p>", unsafe_allow_html=True)
+        log_lines.append(msg)
+        html = "".join(f"<p style='color:{'#f87171' if '⚠️' in l else '#6b7080'};font-size:0.82rem;margin:2px 0'>{l}</p>" for l in log_lines[-8:])
+        status.markdown(html, unsafe_allow_html=True)
 
     with st.spinner(""):
         cb("Kategori ağacı çekiliyor...")
@@ -668,6 +687,7 @@ if run_btn and domain_input:
 
     status.empty()
     prog.empty()
+    results["logs"] = log_lines
     st.session_state.results = results
 
 # ── Sonuçlar ─────────────────────────────────────────────────
@@ -677,6 +697,15 @@ if st.session_state.results:
     cats = r["categories"]
     kws  = r["keywords"]
     dom  = r["domain"]
+
+    warnings = [l for l in r.get("logs", []) if "⚠️" in l]
+    if warnings:
+        st.markdown(
+            "<div style='background:#3a1a1a;border:1px solid #5a2a2a;border-radius:8px;padding:14px 18px;margin-bottom:20px'>"
+            + "".join(f"<p style='color:#f87171;font-size:0.85rem;margin:2px 0'>{w}</p>" for w in warnings)
+            + "</div>",
+            unsafe_allow_html=True
+        )
 
     # Metrikler
     high_count = sum(1 for g in gaps if g["priority"] == "high")
