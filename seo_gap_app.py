@@ -9,6 +9,7 @@ from datetime import datetime
 from io import BytesIO
 
 import requests
+from bs4 import BeautifulSoup
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -261,19 +262,126 @@ def fetch_category_product_counts(domain, categories, progress_cb=None):
     return categories
 
 
+def fetch_nav_tree(domain, progress_cb=None):
+    """
+    Ana sayfadaki navigasyon menüsünden Kadın > Çanta > Deri Çanta gibi
+    hiyerarşiyi çıkarır. Shopify temaları farklı HTML yapıları kullandığı
+    için birkaç farklı strateji deniyoruz; bulamazsak boş döner (flat liste
+    fallback'i devam eder).
+
+    Dönen yapı:
+    {
+        "Kadın": {"handle": "kadin", "children": {
+            "Çanta": {"handle": "kadin-canta", "children": {
+                "Deri Çanta": {"handle": "deri-canta", "children": {}}
+            }}
+        }}
+    }
+    """
+    try:
+        r = requests.get(f"https://{domain}/", headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            if progress_cb:
+                progress_cb(f"⚠️ Ana sayfa HTTP {r.status_code} — navigasyon menüsü atlanıyor.")
+            return {}
+        soup = BeautifulSoup(r.text, "html.parser")
+    except Exception as e:
+        if progress_cb:
+            progress_cb(f"⚠️ Ana sayfa çekme hatası: {e}")
+        return {}
+
+    nav = soup.find("nav") or soup.find(attrs={"role": "navigation"}) \
+          or soup.find(class_=re.compile(r"(main-nav|navigation|menu)", re.I))
+    if not nav:
+        if progress_cb:
+            progress_cb("⚠️ Navigasyon menüsü bulunamadı, düz kategori listesi kullanılacak.")
+        return {}
+
+    def handle_from_href(href):
+        m = re.search(r"/collections/([a-z0-9\-]+)", href or "", re.IGNORECASE)
+        return m.group(1) if m else None
+
+    def parse_list(ul_tag, depth=0):
+        """Bir <ul> içindeki <li>'leri gezer, her biri için isim/handle/children çıkarır."""
+        tree = {}
+        if not ul_tag or depth > 3:
+            return tree
+        for li in ul_tag.find_all("li", recursive=False):
+            a = li.find("a", recursive=False) or li.find("a")
+            if not a:
+                continue
+            name = a.get_text(strip=True)
+            href = a.get("href", "")
+            handle = handle_from_href(href)
+            if not name or len(name) > 40:
+                continue
+            sub_ul = li.find("ul")
+            children = parse_list(sub_ul, depth + 1) if sub_ul else {}
+            if handle or children:
+                tree[name] = {"handle": handle, "children": children}
+        return tree
+
+    top_ul = nav.find("ul")
+    tree = parse_list(top_ul, 0)
+
+    # Bazı temalarda en üst seviye <ul> değil, nav'ın direkt çocukları <li>'dir
+    if not tree:
+        tree = parse_list(nav, 0)
+
+    if progress_cb:
+        total_nodes = _count_tree_nodes(tree)
+        progress_cb(f"Navigasyon menüsünden {total_nodes} kategori düğümü çıkarıldı.")
+    return tree
+
+
+def _count_tree_nodes(tree):
+    count = len(tree)
+    for node in tree.values():
+        count += _count_tree_nodes(node.get("children", {}))
+    return count
+
+
+def flatten_nav_tree(tree, parent_path=None):
+    """
+    Nav ağacını düz bir handle->path eşlemesine çevirir.
+    Örn: {"kadin-canta": ["Kadın", "Çanta"], "deri-canta": ["Kadın", "Çanta", "Deri Çanta"]}
+    """
+    parent_path = parent_path or []
+    mapping = {}
+    for name, node in tree.items():
+        path = parent_path + [name]
+        if node.get("handle"):
+            mapping[node["handle"]] = path
+        mapping.update(flatten_nav_tree(node.get("children", {}), path))
+    return mapping
+
+
+def top_level_groups(tree):
+    """Nav ağacının en üst seviyesini döndürür — örn. ['Kadın', 'Erkek', 'Ayakkabı', ...]."""
+    return list(tree.keys())
+
+
 def fetch_site_data(domain, progress_cb=None):
     platform = detect_platform(domain)
     if platform != "shopify":
         if progress_cb:
             progress_cb("⚠️ Shopify olmayan siteler için ürün eşleştirmesi şu an desteklenmiyor.")
-        return [], [], []
+        return [], [], [], {}
     if progress_cb:
         progress_cb("Platform: SHOPIFY")
+    nav_tree = fetch_nav_tree(domain, progress_cb)
+    handle_to_path = flatten_nav_tree(nav_tree) if nav_tree else {}
+
     collections = fetch_all_collections(domain, progress_cb)
     real_cats, noise_cats = build_categories(collections, progress_cb)
+
+    for cat in real_cats:
+        path = handle_to_path.get(cat["handle"])
+        cat["nav_path"] = path or [cat["title"]]
+
     real_cats = fetch_category_product_counts(domain, real_cats, progress_cb)
     products = fetch_all_products(domain, progress_cb)
-    return real_cats, noise_cats, products
+    return real_cats, noise_cats, products, nav_tree
 
 
 # ══════════════════════════════════════════════════════════════
@@ -394,9 +502,18 @@ TR_PLACE_NAMES = {
 }
 ABSTRACT_PLACE_SUFFIXES = {"fabrika","sanayi","fotograflari","sitesi","depo","yapi"}
 
+# Bu kelimeler tek başına da (şehir adı olmadan) çok büyük olasılıkla bir ürün
+# kategorisi değil, bir kurum/site/depo/firma adını işaret eder — marka bağımsız.
+STANDALONE_NON_CATEGORY_SUFFIXES = {"sitesi","depo","fabrika","plaza","center","sirketi","şirketi"}
+
 def _looks_like_place_query(tokens):
     """'<şehir> <soyut kelime>' kalıbı — örn. 'eskişehir fabrika', 'adana fotoğrafları'. tokens zaten _norm() ile ASCII'ye çevrilmiş olmalı."""
-    return any(t in TR_PLACE_NAMES for t in tokens) and any(t in ABSTRACT_PLACE_SUFFIXES for t in tokens)
+    if any(t in TR_PLACE_NAMES for t in tokens) and any(t in ABSTRACT_PLACE_SUFFIXES for t in tokens):
+        return True
+    # Şehir adı olmasa da "X Sitesi", "X Depo", "X Plaza" gibi kurumsal/lokasyon kalıpları
+    if any(t in STANDALONE_NON_CATEGORY_SUFFIXES for t in tokens):
+        return True
+    return False
 
 
 def run_gap_analysis(keywords, categories, products, progress_cb=None):
@@ -404,14 +521,12 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None):
         progress_cb("Gap analizi yapılıyor...")
 
     matched, orphans = [], []
-    groups = defaultdict(lambda: {"keywords": [], "total_volume": 0})
+    groups = defaultdict(lambda: {"keywords": [], "total_volume": 0, "parent_cat": None})
 
     for kw in keywords:
         word, vol = kw.get("keyword", ""), kw.get("search_volume", 0)
         if vol < 100:
             continue
-        if any(_matches_category(word, c) for c in categories):
-            matched.append(kw); continue
         if NON_CATEGORY_RE.search(word):
             orphans.append(kw); continue
 
@@ -419,11 +534,36 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None):
         tokens = norm_word.split()
         if _looks_like_place_query(tokens):
             orphans.append(kw); continue
-        # Tek kelimelik, çok genel (marka/şehir/jenerik) terimleri ele — gap için en az 2 kelime istiyoruz
-        # ya da tek kelime ama bilinen bir modifier ise (örn. "sneakers") kabul et.
+
+        # En iyi eşleşen mevcut kategoriyi bul (en çok ortak token'a sahip olan)
+        best_cat, best_overlap = None, 0
+        for c in categories:
+            cat_tokens = _tokens(c["title"]) | _tokens(c["handle"])
+            overlap = len(_tokens(word) & cat_tokens)
+            if overlap > best_overlap:
+                best_overlap, best_cat = overlap, c
+
+        kw_tokens = _tokens(word)
+        cat_tokens = (_tokens(best_cat["title"]) | _tokens(best_cat["handle"])) if best_cat else set()
+        extra_tokens = kw_tokens - cat_tokens   # keyword'de olup kategori isminde olmayan kelimeler
+
+        if best_cat and not extra_tokens:
+            # Keyword zaten kategori ismiyle tam örtüşüyor → gerçekten kategoriye ait, gap değil
+            matched.append(kw); continue
+
+        if best_cat and extra_tokens and best_overlap > 0:
+            # Kısmi eşleşme: "hasır çanta" ~ "Çanta" kategorisi + "hasır" ek kelime → alt kategori adayı
+            if len(tokens) < 2 and norm_word not in MODIFIERS and not extra_tokens & MODIFIERS:
+                orphans.append(kw); continue
+            key = norm_word
+            groups[key]["keywords"].append(kw)
+            groups[key]["total_volume"] += vol
+            groups[key]["parent_cat"] = best_cat
+            continue
+
+        # Hiçbir kategoriyle örtüşmedi — tamamen yeni bir kategori adayı
         if len(tokens) < 2 and norm_word not in MODIFIERS:
             orphans.append(kw); continue
-
         key = norm_word
         groups[key]["keywords"].append(kw)
         groups[key]["total_volume"] += vol
@@ -435,6 +575,7 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None):
         top = max(group["keywords"], key=lambda x: x["search_volume"])
         vol = group["total_volume"]
         label = top["keyword"].title()
+        parent_cat = group.get("parent_cat")
 
         query_tokens = _tokens(top["keyword"])
         real_product_count = count_matching_products(query_tokens, products)
@@ -446,10 +587,14 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None):
         else:
             status = "none"
 
+        nav_group = (parent_cat.get("nav_path", [parent_cat["title"]])[0] if parent_cat
+                     else (top.get("nav_group") or "Diğer"))
+
         gaps.append({
             "suggested_category":     label,
             "modifier":                next((t for t in query_tokens if t in MODIFIERS), ""),
-            "base_category":           "Belirsiz",
+            "base_category":           parent_cat["title"] if parent_cat else "Belirsiz",
+            "nav_group":               nav_group,
             "keyword_count":           len(group["keywords"]),
             "total_search_volume":     vol,
             "top_keyword":             top["keyword"],
@@ -667,7 +812,7 @@ if run_btn and domain_input:
 
     cb("Site verisi çekiliyor (büyük sitelerde birkaç dakika sürebilir)...")
     prog.progress(5)
-    real_cats, noise_cats, products = fetch_site_data(domain, cb)
+    real_cats, noise_cats, products, nav_tree = fetch_site_data(domain, cb)
 
     prog.progress(55)
     keywords = fetch_domain_keywords(domain, cb)
@@ -675,7 +820,8 @@ if run_btn and domain_input:
     prog.progress(80)
     results = run_gap_analysis(keywords, real_cats, products, cb)
     results.update({"categories": real_cats, "noise_categories": noise_cats,
-                     "products": products, "keywords": keywords, "domain": domain, "logs": log_lines})
+                     "products": products, "keywords": keywords, "domain": domain,
+                     "logs": log_lines, "nav_tree": nav_tree})
     prog.progress(100)
 
     status.empty(); prog.empty()
@@ -683,19 +829,43 @@ if run_btn and domain_input:
 
 if st.session_state.results:
     r = st.session_state.results
-    gaps, cats, noise_cats = r["gaps"], r["categories"], r.get("noise_categories", [])
+    gaps_all, cats, noise_cats = r["gaps"], r["categories"], r.get("noise_categories", [])
     products, kws, dom = r.get("products", []), r["keywords"], r["domain"]
+    nav_tree = r.get("nav_tree", {})
 
     warnings = [l for l in r.get("logs", []) if "⚠" in l]
     if warnings:
         st.markdown("<div class='warn-box'>" + "<br>".join(warnings) + "</div>", unsafe_allow_html=True)
+
+    # ── Üst seviye grup navigasyonu (Kadın / Erkek / Ayakkabı / Çanta ...) ──
+    nav_groups = top_level_groups(nav_tree) if nav_tree else []
+    selected_group = "Tümü"
+    if nav_groups:
+        st.markdown('<div class="section-title">Kategori Grubu Seç</div>', unsafe_allow_html=True)
+        selected_group = st.radio(
+            "", ["Tümü"] + nav_groups, horizontal=True, label_visibility="collapsed"
+        )
+
+    def cat_in_group(cat, group):
+        if group == "Tümü":
+            return True
+        path = cat.get("nav_path", [cat["title"]])
+        return bool(path) and path[0] == group
+
+    def gap_in_group(gap, group):
+        if group == "Tümü":
+            return True
+        return gap.get("nav_group") == group
+
+    cats_filtered = [c for c in cats if cat_in_group(c, selected_group)] if nav_groups else cats
+    gaps = [g for g in gaps_all if gap_in_group(g, selected_group)] if nav_groups else gaps_all
 
     opp_count  = sum(1 for g in gaps if g["status"] == "opportunity")
     high_count = sum(1 for g in gaps if g["status"] == "high")
 
     st.markdown(f"""
     <div class="metric-grid">
-        <div class="metric-card"><div class="label">Mevcut Kategori</div><div class="value">{len(cats)}</div><div class="sub">{len(noise_cats)} kampanya/test ayrıldı</div></div>
+        <div class="metric-card"><div class="label">Mevcut Kategori</div><div class="value">{len(cats_filtered)}</div><div class="sub">{len(noise_cats)} kampanya/test ayrıldı</div></div>
         <div class="metric-card"><div class="label">Toplam Ürün</div><div class="value">{len(products):,}</div><div class="sub">sitede taranan</div></div>
         <div class="metric-card"><div class="label">Analiz Edilen Keyword</div><div class="value">{len(kws):,}</div><div class="sub">organik keyword</div></div>
         <div class="metric-card good"><div class="label">Gerçek Fırsat</div><div class="value">{opp_count}</div><div class="sub">ürün var, sayfa yok</div></div>
@@ -713,10 +883,10 @@ if st.session_state.results:
             <span><span class="dot" style="background:#fad9b3"></span>Hacim var, ürün yok</span>
         </div>
         """, unsafe_allow_html=True)
-        if cats or gaps:
-            st.plotly_chart(build_treemap(cats, gaps), use_container_width=True, config={"displayModeBar": False})
+        if cats_filtered or gaps:
+            st.plotly_chart(build_treemap(cats_filtered, gaps), use_container_width=True, config={"displayModeBar": False})
         else:
-            st.info("Gösterilecek kategori verisi yok.")
+            st.info("Bu grupta gösterilecek kategori verisi yok.")
 
     with col_bar:
         st.markdown('<div class="section-title">Gap Hacimleri</div>', unsafe_allow_html=True)
@@ -724,7 +894,7 @@ if st.session_state.results:
         if bar:
             st.plotly_chart(bar, use_container_width=True, config={"displayModeBar": False})
         else:
-            st.info("Gap önerisi bulunamadı.")
+            st.info("Bu grupta gap önerisi bulunamadı.")
 
     st.markdown(f'<div class="section-title">Kategori Önerileri <span class="count">{len(gaps)}</span></div>', unsafe_allow_html=True)
     if gaps:
@@ -747,10 +917,10 @@ if st.session_state.results:
         if len(gaps) > 60:
             st.caption(f"İlk 60 öneri gösteriliyor. Tam liste ({len(gaps)} satır) Excel raporunda.")
     else:
-        st.info("Hiç gap önerisi bulunamadı.")
+        st.info("Bu grupta hiç gap önerisi bulunamadı.")
 
     # ── En çok hacim getiren mevcut kategoriler ──
-    top_cats_table = build_top_categories_table(cats, r.get("matched", []))
+    top_cats_table = build_top_categories_table(cats_filtered, r.get("matched", []))
     st.markdown('<div class="section-title">En Çok Hacim Getiren Mevcut Kategoriler</div>', unsafe_allow_html=True)
     if top_cats_table:
         tc_html = "<div class='dtable'><div class='row head' style='grid-template-columns:2.5fr 1fr 1fr 1fr'>" \
@@ -766,7 +936,7 @@ if st.session_state.results:
         tc_html += "</div>"
         st.markdown(tc_html, unsafe_allow_html=True)
     else:
-        st.info("Mevcut kategorilerle eşleşen keyword bulunamadı.")
+        st.info("Bu grupta eşleşen keyword bulunamadı.")
 
     # ── Filtrelenen kampanya/test koleksiyonları — grid görünüm ──
     if noise_cats:
@@ -780,7 +950,7 @@ if st.session_state.results:
             st.markdown(f"<div>{chips}</div>", unsafe_allow_html=True)
 
     st.markdown("<div style='margin-top:20px'>", unsafe_allow_html=True)
-    excel_buf = generate_excel(gaps, cats, noise_cats, kws, dom)
+    excel_buf = generate_excel(gaps_all, cats, noise_cats, kws, dom)
     st.download_button(
         label="⬇ Excel Raporu İndir",
         data=excel_buf,
