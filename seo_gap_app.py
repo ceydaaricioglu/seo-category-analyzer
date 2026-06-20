@@ -146,13 +146,38 @@ def detect_platform(domain, progress_cb=None):
 
 def fetch_all_collections(domain, progress_cb=None):
     collections, page = [], 1
+    consecutive_errors = 0
     while True:
-        try:
-            r = requests.get(f"https://{domain}/collections.json?limit=250&page={page}", headers=HEADERS, timeout=15)
-            cols = r.json().get("collections", [])
-        except Exception:
-            break
+        cols = None
+        for attempt in range(3):
+            try:
+                r = requests.get(f"https://{domain}/collections.json?limit=250&page={page}", headers=HEADERS, timeout=15)
+                if r.status_code == 429:
+                    wait = 4 * (attempt + 1)
+                    if progress_cb:
+                        progress_cb(f"⚠️ collections.json rate-limit (429) — {wait}s bekleniyor...")
+                    time.sleep(wait)
+                    continue
+                if r.status_code != 200:
+                    if progress_cb:
+                        progress_cb(f"⚠️ collections.json HTTP {r.status_code} döndü (sayfa {page}).")
+                    cols = []
+                    break
+                data = r.json()
+                cols = data.get("collections", [])
+                break
+            except Exception as e:
+                if progress_cb:
+                    progress_cb(f"⚠️ collections.json hatası: {e}")
+                cols = []
+                break
+        if cols is None:
+            cols = []
         if not cols:
+            consecutive_errors += 1
+            if consecutive_errors >= 2 and page == 1:
+                if progress_cb:
+                    progress_cb("⚠️ İlk sayfada hiç koleksiyon bulunamadı — kategori verisi boş kalabilir.")
             break
         collections.extend(cols)
         if progress_cb:
@@ -160,7 +185,7 @@ def fetch_all_collections(domain, progress_cb=None):
         if len(cols) < 250:
             break
         page += 1
-        time.sleep(0.2)
+        time.sleep(0.3)
     return collections
 
 
@@ -491,8 +516,9 @@ def fetch_generic_products_via_search(domain, queries, progress_cb=None):
 def fetch_nav_tree(domain, progress_cb=None):
     """
     Ana sayfadaki navigasyon menüsünden Kadın > Çanta > Deri Çanta gibi
-    hiyerarşiyi çıkarır. Shopify temaları farklı HTML yapıları kullandığı
-    için birkaç farklı strateji deniyoruz; bulamazsak boş döner (flat liste
+    hiyerarşiyi çıkarır. Shopify temaları çok farklı HTML yapıları kullanabilir
+    (mega-menu'lerde <li> ile alt <ul> arasına <div> girebilir), bu yüzden
+    esnek bir arama stratejisi kullanılır. Bulamazsak boş döner (flat liste
     fallback'i devam eder).
 
     Dönen yapı:
@@ -516,47 +542,77 @@ def fetch_nav_tree(domain, progress_cb=None):
             progress_cb(f"⚠️ Ana sayfa çekme hatası: {e}")
         return {}
 
-    nav = soup.find("nav") or soup.find(attrs={"role": "navigation"}) \
-          or soup.find(class_=re.compile(r"(main-nav|navigation|menu)", re.I))
-    if not nav:
-        if progress_cb:
-            progress_cb("⚠️ Navigasyon menüsü bulunamadı, düz kategori listesi kullanılacak.")
-        return {}
-
     def handle_from_href(href):
         m = re.search(r"/collections/([a-z0-9\-]+)", href or "", re.IGNORECASE)
         return m.group(1) if m else None
 
+    def nearest_child_ul(li_tag):
+        """<li> içinde, ara div/span'lara bakmadan en yakın <ul>'u bulur (li'nin kendi <ul>'u değilse)."""
+        for child in li_tag.find_all("ul"):
+            return child   # ilk bulunan iç <ul>, derinlik önemli değil — mega menu'lerde tek seviye olur
+        return None
+
     def parse_list(ul_tag, depth=0):
-        """Bir <ul> içindeki <li>'leri gezer, her biri için isim/handle/children çıkarır."""
+        """Bir <ul> içindeki <li>'leri (recursive=False ile direkt çocuklar) gezer."""
         tree = {}
         if not ul_tag or depth > 3:
             return tree
-        for li in ul_tag.find_all("li", recursive=False):
-            a = li.find("a", recursive=False) or li.find("a")
+        direct_lis = ul_tag.find_all("li", recursive=False)
+        if not direct_lis:
+            # Bazı temalarda <ul> doğrudan <li> içermez, class bazlı menu item div'leri olur
+            direct_lis = ul_tag.find_all(["li"], recursive=True)
+        for li in direct_lis:
+            a = li.find("a")
             if not a:
                 continue
             name = a.get_text(strip=True)
             href = a.get("href", "")
             handle = handle_from_href(href)
-            if not name or len(name) > 40:
+            if not name or len(name) > 40 or len(name) < 2:
                 continue
-            sub_ul = li.find("ul")
+            sub_ul = nearest_child_ul(li)
             children = parse_list(sub_ul, depth + 1) if sub_ul else {}
             if handle or children:
-                tree[name] = {"handle": handle, "children": children}
+                tree.setdefault(name, {"handle": handle, "children": children})
         return tree
 
-    top_ul = nav.find("ul")
-    tree = parse_list(top_ul, 0)
+    def find_best_nav_candidate():
+        """Birden fazla aday dener, en çok /collections/ linki içereni seçer."""
+        candidates = []
+        for tag in soup.find_all(["nav", "header"]):
+            candidates.append(tag)
+        for cls_pattern in ["main-nav", "navigation", "menu", "site-nav", "header-nav", "mega-menu"]:
+            found = soup.find_all(class_=re.compile(cls_pattern, re.I))
+            candidates.extend(found)
+        if not candidates:
+            candidates = [soup]   # son çare: tüm body'de ara
 
-    # Bazı temalarda en üst seviye <ul> değil, nav'ın direkt çocukları <li>'dir
+        best, best_count = None, 0
+        for cand in candidates:
+            count = len(cand.find_all("a", href=re.compile(r"/collections/")))
+            if count > best_count:
+                best, best_count = cand, count
+        return best, best_count
+
+    nav, link_count = find_best_nav_candidate()
+    if not nav or link_count < 2:
+        if progress_cb:
+            progress_cb("⚠️ Navigasyon menüsü bulunamadı, düz kategori listesi kullanılacak.")
+        return {}
+
+    # Nav içindeki en üst seviye <ul>'ları dene — birden fazla olabilir (örn. ayrı sol/sağ menu)
+    top_uls = nav.find_all("ul", recursive=False) or nav.find_all("ul")
+    tree = {}
+    for ul in top_uls[:3]:
+        partial = parse_list(ul, 0)
+        tree.update(partial)
+
     if not tree:
         tree = parse_list(nav, 0)
 
     if progress_cb:
         total_nodes = _count_tree_nodes(tree)
-        progress_cb(f"Navigasyon menüsünden {total_nodes} kategori düğümü çıkarıldı.")
+        progress_cb(f"Navigasyon menüsünden {total_nodes} kategori düğümü çıkarıldı ({link_count} link tespit edildi).")
     return tree
 
 
@@ -587,6 +643,36 @@ def top_level_groups(tree):
     return list(tree.keys())
 
 
+# Nav menüsü bulunamadığında, kategori isimlerinin İLK kelimesinden grup çıkarmak için
+# kullanılan bilinen önekler (marka bağımsız, herhangi bir Türkçe e-ticaret sitesinde geçerli).
+GENDER_PREFIX_HINTS = {"kadin": "Kadın", "erkek": "Erkek", "cocuk": "Çocuk", "bebek": "Bebek", "unisex": "Unisex"}
+
+
+def build_fallback_groups(categories):
+    """
+    Nav menüsü bulunamadığında kategori isimlerinden basit bir gruplama çıkarır.
+    'Kadın Bot', 'Kadın Ayakkabı' -> grup 'Kadın'; eşleşmeyenler kendi başlığını grup sayar.
+    Her kategoriye nav_path atar (zaten yoksa).
+    """
+    for cat in categories:
+        if cat.get("nav_path") and cat["nav_path"] != [cat["title"]]:
+            continue   # zaten gerçek nav_path var, dokunma
+        first_word = _norm(cat["title"]).split()[0] if cat["title"] else ""
+        group = GENDER_PREFIX_HINTS.get(first_word)
+        cat["nav_path"] = [group, cat["title"]] if group else [cat["title"]]
+    return categories
+
+
+def top_level_groups_from_categories(categories):
+    """Kategorilerin nav_path'lerinden (gerçek nav ya da fallback) benzersiz üst grupları çıkarır."""
+    groups, seen = [], set()
+    for cat in categories:
+        g = cat.get("nav_path", [cat["title"]])[0]
+        if g and g not in seen and g != cat["title"]:
+            seen.add(g); groups.append(g)
+    return groups
+
+
 def fetch_site_data(domain, progress_cb=None, force_shopify=False, crawl_mode="full_crawl",
                      category_urls=None, product_urls=None):
     """
@@ -610,6 +696,11 @@ def fetch_site_data(domain, progress_cb=None, force_shopify=False, crawl_mode="f
         for cat in real_cats:
             path = handle_to_path.get(cat["handle"])
             cat["nav_path"] = path or [cat["title"]]
+        if not nav_tree:
+            real_cats = build_fallback_groups(real_cats)
+            if progress_cb:
+                fb_groups = top_level_groups_from_categories(real_cats)
+                progress_cb(f"Nav menü bulunamadı, kategori isimlerinden {len(fb_groups)} grup tahmin edildi.")
 
         real_cats = fetch_category_product_counts(domain, real_cats, progress_cb)
         products = fetch_all_products(domain, progress_cb)
@@ -632,6 +723,11 @@ def fetch_site_data(domain, progress_cb=None, force_shopify=False, crawl_mode="f
     for cat in real_cats:
         path = handle_to_path.get(cat["handle"])
         cat["nav_path"] = path or [cat["title"]]
+    if not nav_tree:
+        real_cats = build_fallback_groups(real_cats)
+        if progress_cb:
+            fb_groups = top_level_groups_from_categories(real_cats)
+            progress_cb(f"Nav menü bulunamadı, kategori isimlerinden {len(fb_groups)} grup tahmin edildi.")
 
     if crawl_mode == "full_crawl":
         products = fetch_generic_products_full(domain, product_urls, progress_cb)
@@ -1199,7 +1295,7 @@ if st.session_state.results:
         st.markdown("<div class='warn-box'>" + "<br>".join(warnings) + "</div>", unsafe_allow_html=True)
 
     # ── Üst seviye grup navigasyonu (Kadın / Erkek / Ayakkabı / Çanta ...) ──
-    nav_groups = top_level_groups(nav_tree) if nav_tree else []
+    nav_groups = top_level_groups(nav_tree) if nav_tree else top_level_groups_from_categories(cats)
     selected_group = "Tümü"
     if nav_groups:
         st.markdown('<div class="section-title">Kategori Grubu Seç</div>', unsafe_allow_html=True)
