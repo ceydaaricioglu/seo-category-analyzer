@@ -110,13 +110,31 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SEOGapAnalyzer/1.0)"}
 # 1. SHOPIFY — kategoriler + TÜM ürün başlıkları
 # ══════════════════════════════════════════════════════════════
 
-def detect_platform(domain):
-    try:
-        r = requests.get(f"https://{domain}/collections.json?limit=1", headers=HEADERS, timeout=10)
-        if r.status_code == 200 and "collections" in r.json():
-            return "shopify"
-    except Exception:
-        pass
+def detect_platform(domain, progress_cb=None):
+    for attempt in range(3):
+        try:
+            r = requests.get(f"https://{domain}/collections.json?limit=1", headers=HEADERS, timeout=10)
+            if r.status_code == 200:
+                try:
+                    if "collections" in r.json():
+                        return "shopify"
+                except Exception:
+                    pass
+                return "generic"
+            if r.status_code in (429, 503):
+                if progress_cb and attempt == 0:
+                    progress_cb(f"⚠️ Platform tespiti rate-limit'e çarptı (HTTP {r.status_code}), tekrar deneniyor...")
+                time.sleep(2 * (attempt + 1))
+                continue
+            if progress_cb:
+                progress_cb(f"⚠️ Platform tespiti HTTP {r.status_code} döndü.")
+            return "generic"
+        except Exception as e:
+            if progress_cb:
+                progress_cb(f"⚠️ Platform tespit hatası: {e}")
+            time.sleep(1.5)
+    if progress_cb:
+        progress_cb("⚠️ Platform tespiti 3 denemede de başarısız oldu, 'generic' kabul ediliyor.")
     return "generic"
 
 
@@ -362,7 +380,7 @@ def top_level_groups(tree):
 
 
 def fetch_site_data(domain, progress_cb=None):
-    platform = detect_platform(domain)
+    platform = detect_platform(domain, progress_cb)
     if platform != "shopify":
         if progress_cb:
             progress_cb("⚠️ Shopify olmayan siteler için ürün eşleştirmesi şu an desteklenmiyor.")
@@ -488,6 +506,21 @@ NON_CATEGORY_PATTERNS = [
 ]
 NON_CATEGORY_RE = re.compile("|".join(NON_CATEGORY_PATTERNS), re.IGNORECASE)
 
+# Bilinen 3. parti / rakip ayakkabı-giyim markaları — herhangi bir e-ticaret sitesi için
+# bu markaların adını arayan keyword'ler o sitenin kendi kategori önerisi OLAMAZ
+# (rakip marka taraması ya da zaten var olan "marka filtresi" ihtiyacıdır, otomatik
+# kategori önerisi olarak yanıltıcıdır). Marka-bağımsız genel bir kural.
+THIRD_PARTY_BRANDS = {
+    "nike","adidas","puma","reebok","skechers","caterpillar","cat","new balance",
+    "converse","vans","crocs","clarks","timberland","ecco","geox","lacoste",
+    "tommy","calvin klein","levis","mango","zara","h&m","pull bear","bershka",
+    "north face","columbia","under armour","asics","fila","kappa","lotto",
+}
+
+def _contains_third_party_brand(tokens):
+    joined = " ".join(tokens)
+    return any(b in joined for b in THIRD_PARTY_BRANDS)
+
 # Türkiye'deki büyük şehir/ilçe isimleri — "X Fabrika", "X Sanayi", "X Fotoğrafları" gibi
 # yerel/coğrafi sorgular ürün kategorisi olamaz (herhangi bir marka için).
 # NOT: _norm() Türkçe karakterleri ASCII'ye çevirir (ş→s, ı→i, ö→o, ü→u, ç→c, ğ→g),
@@ -513,6 +546,10 @@ def _looks_like_place_query(tokens):
     # Şehir adı olmasa da "X Sitesi", "X Depo", "X Plaza" gibi kurumsal/lokasyon kalıpları
     if any(t in STANDALONE_NON_CATEGORY_SUFFIXES for t in tokens):
         return True
+    # "<özel isim> <şehir adı>" kalıbı — örn. "espark eskişehir", "deepo antalya".
+    # Ürün kategorisi isimleri neredeyse hiçbir zaman bir şehir adıyla bitmez.
+    if len(tokens) == 2 and tokens[1] in TR_PLACE_NAMES:
+        return True
     return False
 
 
@@ -533,6 +570,8 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None):
         norm_word = _norm(word)
         tokens = norm_word.split()
         if _looks_like_place_query(tokens):
+            orphans.append(kw); continue
+        if _contains_third_party_brand(tokens):
             orphans.append(kw); continue
 
         # En iyi eşleşen mevcut kategoriyi bul (en çok ortak token'a sahip olan)
