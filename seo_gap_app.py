@@ -143,26 +143,39 @@ def fetch_all_products(domain, progress_cb=None, max_pages=200):
     products, page = [], 1
     consecutive_errors = 0
     while page <= max_pages:
-        try:
-            r = requests.get(f"https://{domain}/products.json?limit=250&page={page}", headers=HEADERS, timeout=20)
-            if r.status_code != 200:
+        retry_count = 0
+        items = None
+        while retry_count < 4:
+            try:
+                r = requests.get(f"https://{domain}/products.json?limit=250&page={page}", headers=HEADERS, timeout=20)
+                if r.status_code == 429:
+                    wait = 3 * (retry_count + 1)
+                    if progress_cb and retry_count == 0:
+                        progress_cb(f"⚠️ Rate limit (429) — {wait}s bekleniyor, tekrar denenecek...")
+                    time.sleep(wait)
+                    retry_count += 1
+                    continue
+                if r.status_code != 200:
+                    consecutive_errors += 1
+                    if progress_cb and consecutive_errors == 1:
+                        progress_cb(f"⚠️ /products.json HTTP {r.status_code} döndü (sayfa {page}).")
+                    items = []
+                    break
+                items = r.json().get("products", [])
+                consecutive_errors = 0
+                break
+            except Exception as e:
                 consecutive_errors += 1
                 if progress_cb and consecutive_errors == 1:
-                    progress_cb(f"⚠️ /products.json HTTP {r.status_code} döndü (sayfa {page}).")
-                if consecutive_errors >= 3:
-                    break
-                page += 1
-                continue
-            items = r.json().get("products", [])
-        except Exception as e:
-            consecutive_errors += 1
-            if progress_cb and consecutive_errors == 1:
-                progress_cb(f"⚠️ Ürün çekme hatası: {e}")
-            if consecutive_errors >= 3:
+                    progress_cb(f"⚠️ Ürün çekme hatası: {e}")
+                items = []
                 break
-            page += 1
-            continue
-        consecutive_errors = 0
+        if items is None:
+            items = []
+        if consecutive_errors >= 5:
+            if progress_cb:
+                progress_cb("⚠️ Çok fazla ardışık hata, ürün çekme durduruldu.")
+            break
         if not items:
             break
         for p in items:
@@ -170,12 +183,12 @@ def fetch_all_products(domain, progress_cb=None, max_pages=200):
                 "title": p.get("title", ""),
                 "handle": p.get("handle", ""),
             })
-        if progress_cb and page % 4 == 0:
+        if progress_cb and page % 3 == 0:
             progress_cb(f"Ürünler çekiliyor... ({len(products)} ürün, sayfa {page})")
         if len(items) < 250:
             break
         page += 1
-        time.sleep(0.15)
+        time.sleep(1.2)   # Rate limit'e çarpmamak için sayfalar arası bekleme
     if progress_cb:
         progress_cb(f"Toplam {len(products)} ürün çekildi.")
     return products
@@ -185,18 +198,33 @@ NOISE_PATTERNS = [
     r'^\d+\s*(tl|%)', r'\btest\b', r'\bindirim\w*\b', r'\bkampanya\b',
     r'^\d+[a-z]?$', r'\boutlet\b', r'\bdiscount\b',
     r'^\d+\s*tl\s*(alt[ıi]|üzeri|ve)', r'^#',
+    # Mağaza / lokasyon (AVM, outlet center) sayfaları — ürün kategorisi değil
+    r'\bavm\b', r'\bmagaza\b', r'\bmağaza\b', r'\bpower outlet\b',
+    r'\boutlet center\b', r'\bmarina\b',
 ]
 NOISE_RE = re.compile("|".join(NOISE_PATTERNS), re.IGNORECASE)
+
+# Bilinen mağaza/lokasyon isimleri — "outlet/avm" kelimesi geçmeden de tespit etmek için
+KNOWN_STORE_NAMES = {
+    "espark eskişehir", "espark eskisehir", "selway outlet", "nata vega",
+    "maltepe sahil", "deepo outlet", "tuzla marina", "istinyepark izmir",
+    "viaport venezia avm",
+}
+
+def _is_store_page(title):
+    norm = re.sub(r"[^a-zığüşöçİĞÜŞÖÇ0-9\s]", " ", title.lower()).strip()
+    return norm in KNOWN_STORE_NAMES
 
 
 def build_categories(collections, progress_cb=None):
     real, noise = [], []
     for c in collections:
         title, handle = c.get("title", ""), c.get("handle", "")
-        bucket = noise if (NOISE_RE.search(title) or NOISE_RE.search(handle)) else real
+        is_noise = NOISE_RE.search(title) or NOISE_RE.search(handle) or _is_store_page(title)
+        bucket = noise if is_noise else real
         bucket.append({"title": title, "handle": handle, "product_count": None, "source": "shopify_api"})
     if progress_cb:
-        progress_cb(f"{len(real)} gerçek kategori, {len(noise)} kampanya/test koleksiyonu ayrıldı.")
+        progress_cb(f"{len(real)} gerçek kategori, {len(noise)} kampanya/test/mağaza koleksiyonu ayrıldı.")
     return real, noise
 
 
@@ -207,16 +235,25 @@ def fetch_category_product_counts(domain, categories, progress_cb=None):
         total, page = 0, 1
         try:
             while True:
-                r = requests.get(
-                    f"https://{domain}/collections/{cat['handle']}/products.json?limit=250&page={page}",
-                    headers=HEADERS, timeout=15
-                )
-                items = r.json().get("products", [])
+                retry_count = 0
+                r = None
+                while retry_count < 3:
+                    r = requests.get(
+                        f"https://{domain}/collections/{cat['handle']}/products.json?limit=250&page={page}",
+                        headers=HEADERS, timeout=15
+                    )
+                    if r.status_code == 429:
+                        time.sleep(2 * (retry_count + 1))
+                        retry_count += 1
+                        continue
+                    break
+                items = r.json().get("products", []) if r and r.status_code == 200 else []
                 total += len(items)
                 if len(items) < 250:
                     break
                 page += 1
-                if page > 20:   # güvenlik limiti — 5000 ürünün üzerinde dur
+                time.sleep(0.4)
+                if page > 20:
                     break
             cat["product_count"] = total
         except Exception:
@@ -224,6 +261,7 @@ def fetch_category_product_counts(domain, categories, progress_cb=None):
             errors += 1
         if progress_cb and i % 15 == 0:
             progress_cb(f"Kategori ürün sayıları hesaplanıyor... ({i+1}/{len(categories)})")
+        time.sleep(0.25)
     if progress_cb and errors:
         progress_cb(f"⚠️ {errors} kategori için ürün sayısı çekilemedi.")
     return categories
@@ -335,6 +373,13 @@ def count_matching_products(query_tokens, products):
             count += 1
     return count
 
+NON_CATEGORY_PATTERNS = [
+    r'\bavm\b', r'\boutlet\b', r'\bmagaza\b', r'\bmağaza\b', r'\bşube\b', r'\bsube\b',
+    r'\bmarina\b', r'\bpower outlet\b', r'\bplaza\b', r'\bcenter\b',
+]
+NON_CATEGORY_RE = re.compile("|".join(NON_CATEGORY_PATTERNS), re.IGNORECASE)
+
+
 def run_gap_analysis(keywords, categories, products, progress_cb=None):
     if progress_cb:
         progress_cb("Gap analizi yapılıyor...")
@@ -348,6 +393,8 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None):
             continue
         if any(_matches_category(word, c) for c in categories):
             matched.append(kw); continue
+        if NON_CATEGORY_RE.search(word):
+            orphans.append(kw); continue
 
         norm_word = _norm(word)
         tokens = norm_word.split()
