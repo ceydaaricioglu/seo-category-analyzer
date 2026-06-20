@@ -329,7 +329,32 @@ def fetch_site_categories(domain, progress_cb=None):
     platform = detect_platform(domain)
     if progress_cb:
         progress_cb(f"Platform tespit edildi: {platform.upper()}")
-    return get_shopify_categories(domain, progress_cb) if platform == "shopify" else get_generic_categories(domain, progress_cb)
+    cats = get_shopify_categories(domain, progress_cb) if platform == "shopify" else get_generic_categories(domain, progress_cb)
+    return _filter_noise_categories(cats, progress_cb)
+
+
+NOISE_PATTERNS = [
+    r'^\d+\s*(tl|%)',           # "9000 tl üzeri", "%10 test"
+    r'\btest\b',                # "%10 test", "AÇÇK Kampanya Test Koleksiyonu"
+    r'\bindirim\w*\b',          # "500 TL İndirim", "11 11 indirimleri"
+    r'\bkampanya\b',
+    r'^\d+[a-z]?$',             # "24w", "25s" gibi sezon kodları
+    r'\boutlet\b',
+    r'\bdiscount\b',
+    r'^\d+\s*tl\s*(alt[ıi]|üzeri|ve)',
+]
+NOISE_RE = re.compile("|".join(NOISE_PATTERNS), re.IGNORECASE)
+
+def _filter_noise_categories(categories, progress_cb=None):
+    clean, noise = [], []
+    for c in categories:
+        if NOISE_RE.search(c["title"]) or NOISE_RE.search(c["handle"]):
+            noise.append(c)
+        else:
+            clean.append(c)
+    if progress_cb and noise:
+        progress_cb(f"{len(noise)} kampanya/test koleksiyonu filtrelendi, {len(clean)} gerçek kategori kaldı.")
+    return clean
 
 
 # ══════════════════════════════════════════════════════════════
@@ -363,7 +388,7 @@ def fetch_domain_keywords(domain, progress_cb=None):
     if progress_cb:
         progress_cb("DataForSEO'dan keyword'ler çekiliyor...")
     payload = [{"target": domain, "language_code": "tr", "location_code": 2792,
-                "limit": 2000, "filters": ["keyword_data.keyword_info.search_volume", ">", 0],
+                "limit": 1000, "filters": ["keyword_data.keyword_info.search_volume", ">", 0],
                 "order_by": ["keyword_data.keyword_info.search_volume,desc"]}]
     data = _dfs_post("dataforseo_labs/google/ranked_keywords/live", payload, progress_cb)
     if not data:
@@ -472,21 +497,24 @@ def run_gap_analysis(keywords, categories, progress_cb=None):
 # CHARTS
 # ══════════════════════════════════════════════════════════════
 
-def build_treemap(categories, gaps):
-    """Mevcut kategoriler + gap önerileri — interaktif treemap."""
+def build_treemap(categories, gaps, max_categories=24, max_gaps=12):
+    """Mevcut kategoriler (ürün sayısına göre top N) + gap önerileri — interaktif treemap."""
+    top_cats = sorted(categories, key=lambda c: c["product_count"], reverse=True)[:max_categories]
+    top_gaps = gaps[:max_gaps]
+
     labels, parents, values, colors, texts = ["Site"], [""], [0], ["#1a1d27"], [""]
 
-    for cat in categories:
+    for cat in top_cats:
         labels.append(cat["title"])
         parents.append("Site")
         values.append(max(cat["product_count"], 10))
         colors.append("#1e3a2a")   # koyu yeşil — mevcut
         texts.append(f"Ürün: {cat['product_count']}")
 
-    for gap in gaps:
+    for gap in top_gaps:
         labels.append(f"+ {gap['suggested_category']}")
         parents.append("Site")
-        values.append(max(gap["total_search_volume"] // 10, 10))
+        values.append(max(gap["total_search_volume"] // 5, 50))
         colors.append("#3a1a1a" if gap["priority"] == "warn" else "#2a2a10")
         texts.append(f"Hacim: {gap['total_search_volume']:,} | Ürün: {gap['product_count']}")
 
@@ -740,12 +768,13 @@ if st.session_state.results:
     col_tree, col_bar = st.columns([3, 2])
     with col_tree:
         st.markdown('<div class="section-title">Kategori Haritası</div>', unsafe_allow_html=True)
-        st.markdown("""
-        <div style='display:flex;gap:16px;margin-bottom:12px;font-size:0.75rem;color:#6b7080'>
+        st.markdown(f"""
+        <div style='display:flex;gap:16px;margin-bottom:6px;font-size:0.75rem;color:#6b7080'>
             <span><span style='display:inline-block;width:10px;height:10px;background:#1e3a2a;border-radius:2px;margin-right:6px'></span>Mevcut kategori</span>
             <span><span style='display:inline-block;width:10px;height:10px;background:#2a2a10;border-radius:2px;margin-right:6px'></span>Önerilen</span>
             <span><span style='display:inline-block;width:10px;height:10px;background:#3a1a1a;border-radius:2px;margin-right:6px'></span>Ürün yok</span>
         </div>
+        <p style='font-size:0.72rem;color:#4a4f60;margin-bottom:12px'>En yüksek ürün sayılı 24 kategori + en yüksek hacimli 12 öneri gösteriliyor. Tam liste Excel raporunda.</p>
         """, unsafe_allow_html=True)
         st.plotly_chart(build_treemap(cats, gaps), use_container_width=True, config={"displayModeBar": False})
 
@@ -772,12 +801,15 @@ if st.session_state.results:
     </div>
     <div class="gap-body">
     """ + "".join(f"""
-        <div class="gap-row">
-            <span class="cat-name">+ {g['suggested_category']}</span>
-            <span class="vol">{g['base_category']}</span>
-            <span class="vol">{g['total_search_volume']:,}</span>
-            <span class="vol">{g['product_count']}</span>
-            <span>{badge_map.get(g['priority'],'')}</span>
+        <div class="gap-row" style="grid-template-columns: 2fr 1.2fr 1fr 1fr 1.2fr; flex-direction:column; align-items:start; gap:6px">
+            <div style="display:grid;grid-template-columns: 2fr 1.2fr 1fr 1fr 1.2fr; width:100%; align-items:center">
+                <span class="cat-name">+ {g['suggested_category']}</span>
+                <span class="vol">{g['base_category']}</span>
+                <span class="vol">{g['total_search_volume']:,}</span>
+                <span class="vol">{g['product_count']}</span>
+                <span>{badge_map.get(g['priority'],'')}</span>
+            </div>
+            <div style="font-size:0.76rem;color:#5a5f75;padding-left:2px">{g['sample_keywords']}</div>
         </div>
     """ for g in gaps) + "</div>", unsafe_allow_html=True)
 
