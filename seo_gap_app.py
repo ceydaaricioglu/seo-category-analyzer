@@ -155,6 +155,10 @@ def fetch_all_products(domain, progress_cb=None, max_pages=200):
                     time.sleep(wait)
                     retry_count += 1
                     continue
+                if r.status_code == 400:
+                    # Shopify, sayfa limitinin sonuna gelindiğinde 400 döndürür — bu normal bir bitiş sinyali
+                    items = []
+                    break
                 if r.status_code != 200:
                     consecutive_errors += 1
                     if progress_cb and consecutive_errors == 1:
@@ -198,29 +202,19 @@ NOISE_PATTERNS = [
     r'^\d+\s*(tl|%)', r'\btest\b', r'\bindirim\w*\b', r'\bkampanya\b',
     r'^\d+[a-z]?$', r'\boutlet\b', r'\bdiscount\b',
     r'^\d+\s*tl\s*(alt[ıi]|üzeri|ve)', r'^#',
-    # Mağaza / lokasyon (AVM, outlet center) sayfaları — ürün kategorisi değil
-    r'\bavm\b', r'\bmagaza\b', r'\bmağaza\b', r'\bpower outlet\b',
-    r'\boutlet center\b', r'\bmarina\b',
+    # Mağaza / lokasyon (AVM, outlet, şube, plaza) sayfaları — ürün kategorisi değil, marka bağımsız genel kural
+    r'\bavm\b', r'\bmagaza\w*\b', r'\bmağaza\w*\b', r'\bpower outlet\b',
+    r'\boutlet center\b', r'\bmarina\b', r'\bşube\w*\b', r'\bsube\w*\b',
+    r'\bplaza\b', r'\bpark\b$', r'\bcity\b',
 ]
 NOISE_RE = re.compile("|".join(NOISE_PATTERNS), re.IGNORECASE)
-
-# Bilinen mağaza/lokasyon isimleri — "outlet/avm" kelimesi geçmeden de tespit etmek için
-KNOWN_STORE_NAMES = {
-    "espark eskişehir", "espark eskisehir", "selway outlet", "nata vega",
-    "maltepe sahil", "deepo outlet", "tuzla marina", "istinyepark izmir",
-    "viaport venezia avm",
-}
-
-def _is_store_page(title):
-    norm = re.sub(r"[^a-zığüşöçİĞÜŞÖÇ0-9\s]", " ", title.lower()).strip()
-    return norm in KNOWN_STORE_NAMES
 
 
 def build_categories(collections, progress_cb=None):
     real, noise = [], []
     for c in collections:
         title, handle = c.get("title", ""), c.get("handle", "")
-        is_noise = NOISE_RE.search(title) or NOISE_RE.search(handle) or _is_store_page(title)
+        is_noise = bool(NOISE_RE.search(title) or NOISE_RE.search(handle))
         bucket = noise if is_noise else real
         bucket.append({"title": title, "handle": handle, "product_count": None, "source": "shopify_api"})
     if progress_cb:
@@ -374,10 +368,35 @@ def count_matching_products(query_tokens, products):
     return count
 
 NON_CATEGORY_PATTERNS = [
-    r'\bavm\b', r'\boutlet\b', r'\bmagaza\b', r'\bmağaza\b', r'\bşube\b', r'\bsube\b',
-    r'\bmarina\b', r'\bpower outlet\b', r'\bplaza\b', r'\bcenter\b',
+    # Mağaza / lokasyon / AVM isimleri — marka bağımsız
+    r'\bavm\b', r'\boutlet\b', r'\bmagaza\w*\b', r'\bmağaza\w*\b',
+    r'\bşube\w*\b', r'\bsube\w*\b', r'\bmarina\b', r'\bpower outlet\b', r'\bplaza\b',
+    # "X ne demek / nedir" gibi tanım soruları — ürün kategorisi değil, içerik/blog sorusu
+    r'\bne demek\b', r'\bnedir\b', r'\bne anlama gelir\b',
+    # "boykot", "şikayet", haber/yorum tarzı sorgular — e-ticaret kategorisi değil
+    r'\bboykot\b', r'\bşikayet\w*\b', r'\bsikayet\w*\b', r'\biade\b', r'\biflas\b',
+    # Soyut/şirket-bilgisi sorguları
+    r'\bcompany\b', r'\bfor sale\b', r'\bnasıl\b', r'\bne kadar\b', r'\bfiyatı ne\b',
 ]
 NON_CATEGORY_RE = re.compile("|".join(NON_CATEGORY_PATTERNS), re.IGNORECASE)
+
+# Türkiye'deki büyük şehir/ilçe isimleri — "X Fabrika", "X Sanayi", "X Fotoğrafları" gibi
+# yerel/coğrafi sorgular ürün kategorisi olamaz (herhangi bir marka için).
+# NOT: _norm() Türkçe karakterleri ASCII'ye çevirir (ş→s, ı→i, ö→o, ü→u, ç→c, ğ→g),
+# bu set de aynı normalize edilmiş haliyle tutulur.
+TR_PLACE_NAMES = {
+    "istanbul","ankara","izmir","bursa","antalya","adana","konya","mersin",
+    "kocaeli","izmit","eskisehir","gaziantep","kayseri","samsun",
+    "denizli","sanliurfa","adapazari","malatya",
+    "kahramanmaras","erzurum","diyarbakir",
+    "sivas","balikesir","manisa","tarsus","trabzon","alanya",
+    "edremit","aydin","mugla","van","batman","elazig",
+}
+ABSTRACT_PLACE_SUFFIXES = {"fabrika","sanayi","fotograflari","sitesi","depo","yapi"}
+
+def _looks_like_place_query(tokens):
+    """'<şehir> <soyut kelime>' kalıbı — örn. 'eskişehir fabrika', 'adana fotoğrafları'. tokens zaten _norm() ile ASCII'ye çevrilmiş olmalı."""
+    return any(t in TR_PLACE_NAMES for t in tokens) and any(t in ABSTRACT_PLACE_SUFFIXES for t in tokens)
 
 
 def run_gap_analysis(keywords, categories, products, progress_cb=None):
@@ -398,6 +417,8 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None):
 
         norm_word = _norm(word)
         tokens = norm_word.split()
+        if _looks_like_place_query(tokens):
+            orphans.append(kw); continue
         # Tek kelimelik, çok genel (marka/şehir/jenerik) terimleri ele — gap için en az 2 kelime istiyoruz
         # ya da tek kelime ama bilinen bir modifier ise (örn. "sneakers") kabul et.
         if len(tokens) < 2 and norm_word not in MODIFIERS:
