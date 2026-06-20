@@ -509,23 +509,34 @@ SEARCH_PATH_CANDIDATES = ["/search?q=", "/arama?q=", "/search?query=", "/?s=", "
 def find_working_search_path(domain, progress_cb=None):
     """
     Sitenin hangi arama URL kalıbını kullandığını BİR KERE tespit eder.
-    Bilinen bir test kelimesiyle (örn. 'ayakkabı') her kalıbı dener, ilk
-    çalışanı döndürür. Sonradan her gap için bu sabit kalıp kullanılır —
-    böylece her sorguda 5 farklı path denenmek zorunda kalınmaz.
+    Sadece sayfa boyutuna değil, GERÇEKTEN ürün sonucu işareti (ürün kartı
+    veya 'X sonuç/ürün' metni) var mı diye bakar — boş arama sayfaları da
+    200 OK + büyük HTML döndürebileceği için bu kontrol önemli.
     """
-    test_query = "ayakkabi"
+    test_queries = ["ayakkabi", "elbise", "canta"]
+    result_count_re = re.compile(r'\d+\s*(ürün|sonuç|results?|products?)', re.IGNORECASE)
+
     for path in SEARCH_PATH_CANDIDATES:
-        url = f"https://{domain}{path}{test_query}"
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=8)
-            if r.status_code == 200 and len(r.text) > 500:
-                if progress_cb:
-                    progress_cb(f"Arama endpoint'i bulundu: {path}")
-                return path
-        except Exception:
-            continue
+        for test_query in test_queries:
+            url = f"https://{domain}{path}{test_query}"
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=8)
+                if r.status_code != 200:
+                    continue
+                soup = BeautifulSoup(r.text, "html.parser")
+                cards = soup.select(".product-item,.product-card,[data-product-id],article.product,.product")
+                has_result_text = bool(result_count_re.search(r.text))
+                if cards or has_result_text:
+                    if progress_cb:
+                        progress_cb(f"Arama endpoint'i bulundu: {path} ({len(cards)} ürün kartı tespit edildi)")
+                    return path
+            except Exception:
+                continue
     if progress_cb:
-        progress_cb("⚠️ Çalışan bir arama endpoint'i bulunamadı, ürün eşleştirmesi yapılamayacak.")
+        progress_cb(
+            "⚠️ Çalışan bir arama endpoint'i bulunamadı — bu sitede ürün eşleştirmesi "
+            "yapılamadı, tüm 'Hacim Var Ürün Yok' sonuçları gerçekte 'Bilinmiyor' anlamına gelir."
+        )
     return None
 
 
@@ -1061,7 +1072,8 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None, domain=No
                 rg["group"]["keywords"], key=lambda x: x["search_volume"], reverse=True)[:5]),
         })
     gaps.sort(key=lambda x: x["total_search_volume"], reverse=True)
-    return {"matched": matched, "gaps": gaps, "orphans": orphans}
+    return {"matched": matched, "gaps": gaps, "orphans": orphans,
+             "search_path_found": bool(search_path) if use_search_fallback else None}
 
 
 # ══════════════════════════════════════════════════════════════
