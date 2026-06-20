@@ -506,12 +506,36 @@ def fetch_generic_products_full(domain, product_urls, progress_cb=None, max_prod
 SEARCH_PATH_CANDIDATES = ["/search?q=", "/arama?q=", "/search?query=", "/?s=", "/search/?q="]
 
 
-def try_search_count(domain, query, progress_cb=None):
-    """Sitenin arama endpoint'ini bulmaya çalışır, sonuç sayısını (yaklaşık) okur."""
+def find_working_search_path(domain, progress_cb=None):
+    """
+    Sitenin hangi arama URL kalıbını kullandığını BİR KERE tespit eder.
+    Bilinen bir test kelimesiyle (örn. 'ayakkabı') her kalıbı dener, ilk
+    çalışanı döndürür. Sonradan her gap için bu sabit kalıp kullanılır —
+    böylece her sorguda 5 farklı path denenmek zorunda kalınmaz.
+    """
+    test_query = "ayakkabi"
     for path in SEARCH_PATH_CANDIDATES:
+        url = f"https://{domain}{path}{test_query}"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=8)
+            if r.status_code == 200 and len(r.text) > 500:
+                if progress_cb:
+                    progress_cb(f"Arama endpoint'i bulundu: {path}")
+                return path
+        except Exception:
+            continue
+    if progress_cb:
+        progress_cb("⚠️ Çalışan bir arama endpoint'i bulunamadı, ürün eşleştirmesi yapılamayacak.")
+    return None
+
+
+def try_search_count(domain, query, search_path=None, progress_cb=None):
+    """Sonuç sayısını (yaklaşık) okur. search_path verilmişse SADECE onu dener (hızlı)."""
+    paths = [search_path] if search_path else SEARCH_PATH_CANDIDATES
+    for path in paths:
         url = f"https://{domain}{path}{query.replace(' ', '+')}"
         try:
-            r = requests.get(url, headers=HEADERS, timeout=12)
+            r = requests.get(url, headers=HEADERS, timeout=8)
             if r.status_code != 200:
                 continue
             for pat in [r'(\d+)\s*(ürün|sonuç|results?|products?)\s*bulundu',
@@ -523,6 +547,7 @@ def try_search_count(domain, query, progress_cb=None):
             cards = soup.select(".product-item,.product-card,[data-product-id],article.product,.product")
             if cards:
                 return len(cards)
+            return 0
         except Exception:
             continue
     return None
@@ -975,18 +1000,39 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None, domain=No
         groups[key]["keywords"].append(kw)
         groups[key]["total_volume"] += vol
 
-    gaps = []
+    # ── 1. geçiş: tüm gap'leri oluştur (arama yapmadan, products varsa onunla say) ──
+    raw_gaps = []
     for key, group in groups.items():
         if not group["keywords"]:
             continue
         top = max(group["keywords"], key=lambda x: x["search_volume"])
         vol = group["total_volume"]
-        label = top["keyword"].title()
         parent_cat = group.get("parent_cat")
-
         query_tokens = _tokens(top["keyword"])
-        if use_search_fallback and domain:
-            real_product_count = try_search_count(domain, top["keyword"], progress_cb) or 0
+        raw_gaps.append({
+            "key": key, "group": group, "top": top, "vol": vol,
+            "parent_cat": parent_cat, "query_tokens": query_tokens,
+        })
+    raw_gaps.sort(key=lambda x: x["vol"], reverse=True)
+
+    # ── Arama-fallback modunda: SADECE en yüksek hacimli N gap için canlı sorgu yap ──
+    # (yüzlerce gap için tek tek arama yapmak saatler sürebilir; en değerli adaylara odaklanılır)
+    MAX_SEARCH_QUERIES = 80
+    search_path = None
+    if use_search_fallback and domain and raw_gaps:
+        search_path = find_working_search_path(domain, progress_cb)
+
+    gaps = []
+    for i, rg in enumerate(raw_gaps):
+        top, vol, parent_cat, query_tokens = rg["top"], rg["vol"], rg["parent_cat"], rg["query_tokens"]
+        label = top["keyword"].title()
+
+        if use_search_fallback and domain and search_path and i < MAX_SEARCH_QUERIES:
+            real_product_count = try_search_count(domain, top["keyword"], search_path, progress_cb) or 0
+            if progress_cb and i % 10 == 0:
+                progress_cb(f"Ürün eşleştirmesi kontrol ediliyor... ({i+1}/{min(len(raw_gaps), MAX_SEARCH_QUERIES)})")
+        elif use_search_fallback and (not search_path or i >= MAX_SEARCH_QUERIES):
+            real_product_count = 0   # arama yapılamadı / limit aşıldı — bilinmiyor sayılır
         else:
             real_product_count = count_matching_products(query_tokens, products)
 
@@ -1005,14 +1051,14 @@ def run_gap_analysis(keywords, categories, products, progress_cb=None, domain=No
             "modifier":                next((t for t in query_tokens if t in MODIFIERS), ""),
             "base_category":           parent_cat["title"] if parent_cat else "Belirsiz",
             "nav_group":               nav_group,
-            "keyword_count":           len(group["keywords"]),
+            "keyword_count":           len(rg["group"]["keywords"]),
             "total_search_volume":     vol,
             "top_keyword":             top["keyword"],
             "top_kw_volume":           top["search_volume"],
             "matching_product_count":  real_product_count,
             "status":                  status,
             "sample_keywords":         ", ".join(k["keyword"] for k in sorted(
-                group["keywords"], key=lambda x: x["search_volume"], reverse=True)[:5]),
+                rg["group"]["keywords"], key=lambda x: x["search_volume"], reverse=True)[:5]),
         })
     gaps.sort(key=lambda x: x["total_search_volume"], reverse=True)
     return {"matched": matched, "gaps": gaps, "orphans": orphans}
