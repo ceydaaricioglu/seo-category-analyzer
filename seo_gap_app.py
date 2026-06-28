@@ -1116,6 +1116,8 @@ with col_csv:
     product_csv_file = st.file_uploader(
         "Urun CSV'si (Screaming Frog export, opsiyonel)", type=["csv"], key="product_csv_input"
     )
+    st.caption(f"[DEBUG] widget değeri: {product_csv_file!r}")
+    st.caption(f"[DEBUG] session_state keys: {list(st.session_state.keys())}")
     if product_csv_file is not None:
         st.caption(f"✓ Dosya hazır: {product_csv_file.name} ({product_csv_file.size:,} byte)")
         # Dosya yüklenir yüklenmez hemen parse et (butona basılma anına bağlı kalmadan) —
