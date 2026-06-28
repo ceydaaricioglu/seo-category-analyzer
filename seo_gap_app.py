@@ -957,13 +957,13 @@ def build_treemap(categories, gaps, max_categories=20, max_gaps=10):
     for cat in top_cats:
         labels.append(cat["title"]); parents.append("Site")
         values.append(max(cat["product_count"] or 0, 5))
-        colors.append("#cdeedb")
+        colors.append("#c9d6ed")   # gri-mavi — neutral, "zaten mevcut"
         texts.append(f"Ürün: {cat['product_count']}")
 
     for gap in top_gaps:
         labels.append(f"+ {gap['suggested_category']}"); parents.append("Site")
         values.append(max(gap["total_search_volume"] // 5, 30))
-        colors.append({"opportunity":"#bfe8d2","high":"#fad9b3","none":"#f7c4c4"}[gap["status"]])
+        colors.append({"opportunity":"#5fd99a","high":"#f7b35c","none":"#f08a8a"}[gap["status"]])
         texts.append(f"Hacim: {gap['total_search_volume']:,} · Eşleşen ürün: {gap['matching_product_count']}")
 
     fig = go.Figure(go.Treemap(
@@ -1116,8 +1116,6 @@ with col_csv:
     product_csv_file = st.file_uploader(
         "Urun CSV'si (Screaming Frog export, opsiyonel)", type=["csv"], key="product_csv_input"
     )
-    st.caption(f"[DEBUG] widget değeri: {product_csv_file!r}")
-    st.caption(f"[DEBUG] session_state keys: {list(st.session_state.keys())}")
     if product_csv_file is not None:
         st.caption(f"✓ Dosya hazır: {product_csv_file.name} ({product_csv_file.size:,} byte)")
         # Dosya yüklenir yüklenmez hemen parse et (butona basılma anına bağlı kalmadan) —
@@ -1265,9 +1263,9 @@ if st.session_state.results:
         st.markdown('<div class="section-title">Kategori Haritası</div>', unsafe_allow_html=True)
         st.markdown("""
         <div class="legend">
-            <span><span class="dot" style="background:#cdeedb"></span>Mevcut kategori</span>
-            <span><span class="dot" style="background:#bfe8d2"></span>Fırsat (ürün var)</span>
-            <span><span class="dot" style="background:#fad9b3"></span>Hacim var, ürün yok</span>
+            <span><span class="dot" style="background:#c9d6ed"></span>Mevcut kategori</span>
+            <span><span class="dot" style="background:#5fd99a"></span>Fırsat (ürün var)</span>
+            <span><span class="dot" style="background:#f7b35c"></span>Hacim var, ürün yok</span>
         </div>
         """, unsafe_allow_html=True)
         if cats_filtered or gaps:
@@ -1285,10 +1283,49 @@ if st.session_state.results:
 
     st.markdown(f'<div class="section-title">Kategori Önerileri <span class="count">{len(gaps)}</span></div>', unsafe_allow_html=True)
     if gaps:
+        col_f1, col_f2, col_f3 = st.columns([1.3, 1.3, 2])
+        with col_f1:
+            status_filter = st.selectbox(
+                "Durum filtresi",
+                ["Tümü", "Sadece Fırsat (ürün var)", "Sadece Hacim Var · Ürün Yok", "Sadece Düşük Öncelik"],
+                key="gap_status_filter",
+            )
+        with col_f2:
+            sort_option = st.selectbox(
+                "Sıralama",
+                ["Hacme göre (yüksek→düşük)", "Hacme göre (düşük→yüksek)", "Ürün sayısına göre", "Alfabetik"],
+                key="gap_sort_option",
+            )
+        with col_f3:
+            search_filter = st.text_input("Kategori adında ara", placeholder="örn. çanta, bot, elbise...", key="gap_search_filter")
+
+        filtered_gaps = gaps
+        status_map = {
+            "Sadece Fırsat (ürün var)": "opportunity",
+            "Sadece Hacim Var · Ürün Yok": "high",
+            "Sadece Düşük Öncelik": "none",
+        }
+        if status_filter in status_map:
+            filtered_gaps = [g for g in filtered_gaps if g["status"] == status_map[status_filter]]
+        if search_filter.strip():
+            sf = search_filter.strip().lower()
+            filtered_gaps = [g for g in filtered_gaps if sf in g["suggested_category"].lower()]
+
+        if sort_option == "Hacme göre (yüksek→düşük)":
+            filtered_gaps = sorted(filtered_gaps, key=lambda g: g["total_search_volume"], reverse=True)
+        elif sort_option == "Hacme göre (düşük→yüksek)":
+            filtered_gaps = sorted(filtered_gaps, key=lambda g: g["total_search_volume"])
+        elif sort_option == "Ürün sayısına göre":
+            filtered_gaps = sorted(filtered_gaps, key=lambda g: g["matching_product_count"], reverse=True)
+        elif sort_option == "Alfabetik":
+            filtered_gaps = sorted(filtered_gaps, key=lambda g: g["suggested_category"])
+
+        st.caption(f"{len(filtered_gaps)} / {len(gaps)} öneri gösteriliyor.")
+
         rows_html = "<div class='dtable'><div class='row head' style='grid-template-columns:2fr 1.3fr 1fr 1fr 1.4fr'>" \
                     "<span>Önerilen Kategori</span><span>Baz Kategori</span><span>Toplam Hacim</span>" \
                     "<span>Eşleşen Ürün</span><span>Durum</span></div>"
-        for g in gaps[:60]:
+        for g in filtered_gaps[:60]:
             badge = f'<span class="badge {STATUS_BADGE_CLASS[g["status"]]}">{STATUS_LABEL[g["status"]]}</span>'
             rows_html += (
                 f"<div class='row' style='grid-template-columns:2fr 1.3fr 1fr 1fr 1.4fr'>"
@@ -1301,14 +1338,15 @@ if st.session_state.results:
             )
         rows_html += "</div>"
         st.markdown(rows_html, unsafe_allow_html=True)
-        if len(gaps) > 60:
-            st.caption(f"İlk 60 öneri gösteriliyor. Tam liste ({len(gaps)} satır) Excel raporunda.")
+        if len(filtered_gaps) > 60:
+            st.caption(f"İlk 60 satır gösteriliyor. Tam liste ({len(filtered_gaps)} satır) Excel raporunda.")
     else:
         st.info("Bu grupta hiç gap önerisi bulunamadı.")
 
     # ── En çok hacim getiren mevcut kategoriler ──
     top_cats_table = build_top_categories_table(cats_filtered, r.get("matched", []))
     st.markdown('<div class="section-title">En Çok Hacim Getiren Mevcut Kategoriler</div>', unsafe_allow_html=True)
+    st.caption("Bu kategoriler zaten sitede var ve organik aramadan hacim alıyor — performansı koru/güçlendir.")
     if top_cats_table:
         tc_html = "<div class='dtable'><div class='row head' style='grid-template-columns:2.5fr 1fr 1fr 1fr'>" \
                   "<span>Kategori</span><span>Ürün Sayısı</span><span>Toplam Hacim</span><span>Eşleşen Keyword</span></div>"
@@ -1324,17 +1362,6 @@ if st.session_state.results:
         st.markdown(tc_html, unsafe_allow_html=True)
     else:
         st.info("Bu grupta eşleşen keyword bulunamadı.")
-
-    # ── Filtrelenen kampanya/test koleksiyonları — grid görünüm ──
-    if noise_cats:
-        st.markdown(f'<div class="section-title">Filtrelenen Kampanya / Test Koleksiyonları <span class="count">{len(noise_cats)}</span></div>', unsafe_allow_html=True)
-        with st.expander("Listeyi göster"):
-            chips = "".join(
-                f"<span style='display:inline-block;background:#eceef3;color:#4a4e5c;font-size:0.78rem;"
-                f"padding:4px 11px;border-radius:14px;margin:3px'>{c['title']}</span>"
-                for c in noise_cats[:150]
-            )
-            st.markdown(f"<div>{chips}</div>", unsafe_allow_html=True)
 
     st.markdown("<div style='margin-top:20px'>", unsafe_allow_html=True)
     excel_buf = generate_excel(gaps_all, cats, noise_cats, kws, dom)
