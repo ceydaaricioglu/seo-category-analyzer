@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 import requests
 from bs4 import BeautifulSoup
 import openpyxl
+import pandas as pd
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import plotly.graph_objects as go
@@ -345,8 +346,6 @@ def parse_screaming_frog_csv(uploaded_file, progress_cb=None):
     Dönüş: (products, error_message) — başarılıysa error_message None,
     başarısızsa products=[] ve error_message dolu olur (UI bunu kullanıcıya gösterir).
     """
-    import pandas as pd
-
     raw_bytes = uploaded_file.read()
     df = None
     last_error = None
