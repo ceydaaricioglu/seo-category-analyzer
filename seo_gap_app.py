@@ -410,12 +410,46 @@ def parse_sitemap_urls(sitemap_url, progress_cb=None, _depth=0):
     return urls
 
 
-def estimate_site_size(domain, progress_cb=None):
+def estimate_site_size(domain, progress_cb=None, manual_category_sitemaps=None, manual_product_sitemaps=None):
     """
     Hızlı keşif: sitemap'i tarar, kategori/ürün URL sayısını TAHMİN eder.
     Hiçbir sayfa içeriği çekmez — sadece sitemap XML'inden URL sayar.
     Kullanıcıya 'tüm başlıkları çek mi / hızlı tahmin mi' seçimi sunmak için kullanılır.
+
+    manual_category_sitemaps / manual_product_sitemaps verilirse (kullanıcının
+    elle girdiği sitemap URL'leri), bu sitemap'lerdeki TÜM url'ler doğrudan o
+    türden sayılır — heuristik sınıflandırmaya hiç gerek kalmaz, çok daha
+    güvenilir sonuç verir.
     """
+    manual_cat_urls, manual_prod_urls = [], []
+    if manual_category_sitemaps:
+        for sm in manual_category_sitemaps:
+            manual_cat_urls.extend(parse_sitemap_urls(sm, progress_cb))
+        if progress_cb:
+            progress_cb(f"Manuel kategori sitemap'lerinden {len(manual_cat_urls)} URL okundu.")
+    if manual_product_sitemaps:
+        for sm in manual_product_sitemaps:
+            manual_prod_urls.extend(parse_sitemap_urls(sm, progress_cb))
+        if progress_cb:
+            progress_cb(f"Manuel ürün sitemap'lerinden {len(manual_prod_urls)} URL okundu.")
+
+    if manual_cat_urls or manual_prod_urls:
+        # Eksik kalan tarafı (kategori VEYA ürün) otomatik taramadan tamamla
+        auto_cat_urls, auto_prod_urls = [], []
+        if not manual_cat_urls or not manual_prod_urls:
+            sitemaps = discover_sitemaps(domain, progress_cb)
+            all_urls = []
+            for sm in sitemaps:
+                all_urls.extend(parse_sitemap_urls(sm, progress_cb))
+            auto_cat_urls, auto_prod_urls, _ = classify_sitemap_urls(all_urls)
+        cat_urls  = manual_cat_urls or auto_cat_urls
+        prod_urls = manual_prod_urls or auto_prod_urls
+        return {
+            "category_count": len(cat_urls), "product_count": len(prod_urls),
+            "sitemaps_found": len(manual_category_sitemaps or []) + len(manual_product_sitemaps or []),
+            "category_urls": cat_urls, "product_urls": prod_urls,
+        }
+
     sitemaps = discover_sitemaps(domain, progress_cb)
     if not sitemaps:
         return {"category_count": 0, "product_count": 0, "sitemaps_found": 0,
@@ -487,17 +521,77 @@ def fetch_generic_categories(domain, category_urls, progress_cb=None, max_catego
     return categories
 
 
-def fetch_generic_products_full(domain, product_urls, progress_cb=None, max_products=15000):
-    """TÜM ürün sayfalarını tek tek ziyaret edip başlık çeker. Yavaş ama tam doğru."""
-    products = []
-    urls = product_urls[:max_products]
-    for i, url in enumerate(urls):
+import json
+from pathlib import Path
+
+CHECKPOINT_DIR = Path("/tmp/seo_gap_checkpoints")
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _checkpoint_path(domain):
+    safe_name = re.sub(r"[^a-z0-9]", "_", domain.lower())
+    return CHECKPOINT_DIR / f"{safe_name}.json"
+
+
+def save_checkpoint(domain, data):
+    """İlerlemeyi diske yazar. data: {'products': [...], 'remaining_urls': [...], 'total': N, 'mode': 'full_crawl'}"""
+    try:
+        path = _checkpoint_path(domain)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass   # checkpoint yazma hatası analizi durdurmamalı
+
+
+def load_checkpoint(domain):
+    path = _checkpoint_path(domain)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def clear_checkpoint(domain):
+    path = _checkpoint_path(domain)
+    if path.exists():
+        try:
+            path.unlink()
+        except Exception:
+            pass
+
+
+def fetch_generic_products_full(domain, product_urls, progress_cb=None, max_products=15000,
+                                  resume_from=None, checkpoint_every=200):
+    """
+    TÜM ürün sayfalarını tek tek ziyaret edip başlık çeker. Yavaş ama tam doğru.
+    Her `checkpoint_every` üründe bir ilerleme (işlenen ürünler + kalan URL listesi)
+    diske kaydedilir; kesinti olursa `resume_from` ile kaldığı yerden devam edilebilir.
+    """
+    urls = resume_from["all_urls"] if resume_from else product_urls[:max_products]
+    products = list(resume_from["products"]) if resume_from else []
+    start_index = resume_from["next_index"] if resume_from else 0
+
+    if resume_from and progress_cb:
+        progress_cb(f"Önceki kayıttan devam ediliyor: {start_index}/{len(urls)} ürün zaten işlenmiş.")
+
+    for i in range(start_index, len(urls)):
+        url = urls[i]
         info = scrape_product_title(url)
         if info and info["title"]:
             products.append(info)
         if progress_cb and i % 25 == 0:
             progress_cb(f"Ürün başlıkları çekiliyor... ({i+1}/{len(urls)})")
+        if (i + 1) % checkpoint_every == 0:
+            save_checkpoint(domain, {
+                "products": products, "next_index": i + 1, "total": len(urls),
+                "mode": "full_crawl", "all_urls": urls,
+            })
         time.sleep(0.2)
+
+    clear_checkpoint(domain)   # tamamlandı, checkpoint'e gerek yok
     if progress_cb:
         progress_cb(f"Toplam {len(products)} ürün başlığı çekildi.")
     return products
@@ -797,7 +891,10 @@ def fetch_site_data(domain, progress_cb=None, force_shopify=False, crawl_mode="f
             progress_cb(f"Nav menü bulunamadı, kategori isimlerinden {len(fb_groups)} grup tahmin edildi.")
 
     if crawl_mode == "full_crawl":
-        products = fetch_generic_products_full(domain, product_urls, progress_cb)
+        resume_from = load_checkpoint(domain)
+        if resume_from and resume_from.get("mode") == "full_crawl" and progress_cb:
+            progress_cb(f"⏪ Önceki kesintiden checkpoint bulundu: {resume_from.get('next_index', 0)} ürün zaten işlenmiş.")
+        products = fetch_generic_products_full(domain, product_urls, progress_cb, resume_from=resume_from)
     else:
         # search_estimate modunda ürün başlıkları çekilmez; gap analizi sırasında
         # arama endpoint'i üzerinden canlı sayım yapılır (run_gap_analysis -> search_fallback)
@@ -1269,6 +1366,20 @@ force_shopify = st.checkbox(
     value=False,
 )
 
+with st.expander("Gelişmiş: kategori/ürün sitemap URL'lerini manuel belirt (opsiyonel, daha hızlı ve doğru)"):
+    st.caption("Birden fazla sitemap varsa (örn. TR + EN) her satıra bir URL yazın. Boş bırakılırsa otomatik taranır.")
+    manual_category_sitemaps_raw = st.text_area(
+        "Kategori sitemap URL'leri", placeholder="https://site.com/sitemap_categories.xml\nhttps://site.com/sitemap_categories_en.xml",
+        height=80, key="manual_cat_sitemaps",
+    )
+    manual_product_sitemaps_raw = st.text_area(
+        "Ürün sitemap URL'leri", placeholder="https://site.com/sitemap_products.xml",
+        height=80, key="manual_prod_sitemaps",
+    )
+
+manual_category_sitemaps = [u.strip() for u in manual_category_sitemaps_raw.splitlines() if u.strip()]
+manual_product_sitemaps = [u.strip() for u in manual_product_sitemaps_raw.splitlines() if u.strip()]
+
 if "results" not in st.session_state:
     st.session_state.results = None
 if "discovery" not in st.session_state:
@@ -1280,6 +1391,31 @@ def cb_factory(log_lines, status):
         html = "".join(f"<p style='color:{'#d23c3c' if '⚠' in l else '#767a8a'};font-size:0.8rem;margin:2px 0'>{l}</p>" for l in log_lines[-6:])
         status.markdown(html, unsafe_allow_html=True)
     return cb
+
+# ── Yarım kalmış bir tarama var mı kontrol et ──
+if domain_input:
+    _domain_check = domain_input.strip().replace("https://", "").replace("http://", "").strip("/")
+    _existing_checkpoint = load_checkpoint(_domain_check)
+    if _existing_checkpoint and st.session_state.discovery is None:
+        st.markdown(f"""
+        <div class="warn-box" style="background:#eaf1fd;border-color:#bcd4f5;color:#2a4d7a">
+            Bu domain için yarım kalmış bir tarama bulundu: <b>{_existing_checkpoint.get('next_index', 0)}/{_existing_checkpoint.get('total', '?')}</b> ürün işlenmiş.
+        </div>
+        """, unsafe_allow_html=True)
+        col_resume, col_restart = st.columns(2)
+        with col_resume:
+            if st.button("Kaldığı yerden devam et"):
+                st.session_state.discovery = {
+                    "domain": _domain_check, "platform": "generic",
+                    "crawl_mode": "full_crawl",
+                    "size_info": {"category_urls": [], "product_urls": []},
+                    "resume": True,
+                }
+                st.rerun()
+        with col_restart:
+            if st.button("Sıfırdan başlat (eskiyi sil)"):
+                clear_checkpoint(_domain_check)
+                st.rerun()
 
 # ── 1. AŞAMA: Keşif ──
 if discover_btn and domain_input:
@@ -1295,7 +1431,11 @@ if discover_btn and domain_input:
         st.session_state.discovery = {"domain": domain, "platform": "shopify", "force_shopify": force_shopify}
     else:
         cb("Site büyüklüğü tahmin ediliyor (sitemap taranıyor)...")
-        size_info = estimate_site_size(domain, cb)
+        size_info = estimate_site_size(
+            domain, cb,
+            manual_category_sitemaps=manual_category_sitemaps or None,
+            manual_product_sitemaps=manual_product_sitemaps or None,
+        )
         st.session_state.discovery = {
             "domain": domain, "platform": "generic",
             "size_info": size_info,
@@ -1353,6 +1493,13 @@ if ready_shopify or ready_generic:
         use_search_fallback = False
     else:
         size_info = disc["size_info"]
+        if disc.get("resume") and not size_info.get("category_urls"):
+            cb("Kategori/ürün URL listesi yeniden taranıyor (resume için gerekli)...")
+            size_info = estimate_site_size(
+                domain, cb,
+                manual_category_sitemaps=manual_category_sitemaps or None,
+                manual_product_sitemaps=manual_product_sitemaps or None,
+            )
         real_cats, noise_cats, products, nav_tree = fetch_site_data(
             domain, cb, crawl_mode=disc["crawl_mode"],
             category_urls=size_info["category_urls"], product_urls=size_info["product_urls"],
