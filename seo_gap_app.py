@@ -88,6 +88,7 @@ div[data-testid="stDownloadButton"] button {
 }
 
 .warn-box { background: #fdf0e0; border: 1px solid #f0d4a8; border-radius: 8px; padding: 12px 16px; margin-bottom: 18px; font-size: 0.82rem; color: #8a5a10; }
+.err-box { background: #fdeaea; border: 1px solid #f3c4c4; border-radius: 8px; padding: 12px 16px; margin-bottom: 18px; font-size: 0.82rem; color: #a32424; }
 .stProgress > div > div { background: #4f6ef7 !important; }
 .streamlit-expanderHeader { font-size: 0.85rem !important; }
 </style>
@@ -340,23 +341,44 @@ def parse_screaming_frog_csv(uploaded_file, progress_cb=None):
     """
     Screaming Frog export'undan (Address, Title 1 kolonları) ürün listesini okur.
     Hiçbir HTTP isteği atmaz — saniyeler içinde biter.
+
+    Dönüş: (products, error_message) — başarılıysa error_message None,
+    başarısızsa products=[] ve error_message dolu olur (UI bunu kullanıcıya gösterir).
     """
     import pandas as pd
-    try:
-        df = pd.read_csv(uploaded_file)
-    except Exception as e:
-        if progress_cb:
-            progress_cb(f"⚠️ CSV okunamadı: {e}")
-        return []
 
-    # Kolon adları Screaming Frog versiyonuna göre değişebilir, esnek eşleştir
+    raw_bytes = uploaded_file.read()
+    df = None
+    last_error = None
+
+    # Screaming Frog export'ları farklı encoding/ayraç kullanabilir, birden fazla dene
+    for encoding in ("utf-8-sig", "utf-8", "latin-1", "cp1254"):
+        for sep in (",", ";", "\t"):
+            try:
+                df = pd.read_csv(BytesIO(raw_bytes), encoding=encoding, sep=sep)
+                if df.shape[1] >= 2:   # en az 2 kolon varsa makul bir parse sayılır
+                    break
+                df = None
+            except Exception as e:
+                last_error = e
+                df = None
+        if df is not None:
+            break
+
+    if df is None:
+        msg = f"CSV okunamadı (encoding/ayraç tespit edilemedi). Hata: {last_error}"
+        if progress_cb:
+            progress_cb(f"⚠️ {msg}")
+        return [], msg
+
     addr_col = next((c for c in df.columns if c.strip().lower() in ("address", "url")), None)
     title_col = next((c for c in df.columns if c.strip().lower() in ("title 1", "title1", "title")), None)
 
     if not addr_col or not title_col:
+        msg = f"CSV'de 'Address' veya 'Title 1' kolonu bulunamadı. Bulunan kolonlar: {list(df.columns)}"
         if progress_cb:
-            progress_cb(f"⚠️ CSV'de 'Address' veya 'Title 1' kolonu bulunamadı. Bulunan kolonlar: {list(df.columns)}")
-        return []
+            progress_cb(f"⚠️ {msg}")
+        return [], msg
 
     products = []
     for _, row in df.iterrows():
@@ -365,8 +387,15 @@ def parse_screaming_frog_csv(uploaded_file, progress_cb=None):
         if title and title.lower() != "nan":
             products.append({"title": title, "handle": urlparse(url).path.strip("/").split("/")[-1] if url else ""})
 
+    if not products:
+        msg = "CSV okundu ama hiç ürün satırı bulunamadı (Title 1 kolonu boş olabilir)."
+        if progress_cb:
+            progress_cb(f"⚠️ {msg}")
+        return [], msg
+
     if progress_cb:
         progress_cb(f"Screaming Frog CSV'sinden {len(products)} ürün başlığı okundu.")
+    return products, None
     return products
 
 
@@ -1086,20 +1115,46 @@ def cb_factory(log_lines, status):
         status.markdown(html, unsafe_allow_html=True)
     return cb
 
+if "csv_override_confirmed" not in st.session_state:
+    st.session_state.csv_override_confirmed = False
+
 if run_btn and domain_input:
     domain = domain_input.strip().replace("https://", "").replace("http://", "").strip("/")
-    status = st.empty()
-    prog   = st.progress(0)
-    log_lines = []
-    cb = cb_factory(log_lines, status)
 
     if not category_sitemaps:
         st.error("Kategori sitemap URL'i girilmedi. En az bir sitemap URL'i gerekli.")
         st.stop()
 
     product_csv_data = None
+    csv_parse_error = None
     if product_csv_file is not None:
-        product_csv_data = parse_screaming_frog_csv(product_csv_file, cb)
+        product_csv_data, csv_parse_error = parse_screaming_frog_csv(product_csv_file)
+
+    if csv_parse_error and not st.session_state.csv_override_confirmed:
+        st.markdown(f"""
+        <div class="err-box">
+            ⚠️ CSV dosyası okunamadı: {csv_parse_error}<br>
+            Ürün eşleştirmesi yapılamayacak, sonuçlar daha az kesin olacak (canlı arama tahminine düşülecek).
+        </div>
+        """, unsafe_allow_html=True)
+        col_continue, col_cancel = st.columns(2)
+        with col_continue:
+            if st.button("CSV'siz devam et (arama tahmini kullan)"):
+                st.session_state.csv_override_confirmed = True
+                st.rerun()
+        with col_cancel:
+            st.button("Dur, dosyayı düzelteceğim")
+        st.stop()
+
+    st.session_state.csv_override_confirmed = False   # bir sonraki çalıştırma için sıfırla
+
+    status = st.empty()
+    prog   = st.progress(0)
+    log_lines = []
+    cb = cb_factory(log_lines, status)
+
+    if product_csv_data:
+        cb(f"Screaming Frog CSV'sinden {len(product_csv_data)} ürün başlığı okundu.")
 
     cb("Kategori sitemap'leri taranıyor...")
     prog.progress(15)
