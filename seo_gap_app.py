@@ -358,7 +358,10 @@ def parse_screaming_frog_csv(uploaded_file, progress_cb=None):
     Dönüş: (products, error_message) — başarılıysa error_message None,
     başarısızsa products=[] ve error_message dolu olur (UI bunu kullanıcıya gösterir).
     """
+    uploaded_file.seek(0)
     raw_bytes = uploaded_file.read()
+    if progress_cb:
+        progress_cb(f"CSV dosyası okundu: {len(raw_bytes)} byte.")
     df = None
     last_error = None
 
@@ -1137,10 +1140,18 @@ if run_btn and domain_input:
             st.error("Kategori sitemap URL'i girilmedi. En az bir sitemap URL'i gerekli.")
             st.stop()
 
+        status = st.empty()
+        prog   = st.progress(0)
+        log_lines = []
+        cb = cb_factory(log_lines, status)
+
         product_csv_data = None
         csv_parse_error = None
         if product_csv_file is not None:
-            product_csv_data, csv_parse_error = parse_screaming_frog_csv(product_csv_file)
+            cb(f"CSV dosyası alındı: {product_csv_file.name} ({product_csv_file.size} byte). Okunuyor...")
+            product_csv_data, csv_parse_error = parse_screaming_frog_csv(product_csv_file, cb)
+        else:
+            cb("⚠️ Ürün CSV'si yüklenmedi — gap analizi canlı arama tahminiyle yapılacak (daha az kesin).")
 
         if csv_parse_error and not st.session_state.csv_override_confirmed:
             st.markdown(f"""
@@ -1160,13 +1171,8 @@ if run_btn and domain_input:
 
         st.session_state.csv_override_confirmed = False   # bir sonraki çalıştırma için sıfırla
 
-        status = st.empty()
-        prog   = st.progress(0)
-        log_lines = []
-        cb = cb_factory(log_lines, status)
-
         if product_csv_data:
-            cb(f"Screaming Frog CSV'sinden {len(product_csv_data)} ürün başlığı okundu.")
+            cb(f"✓ Screaming Frog CSV'sinden {len(product_csv_data)} ürün başlığı okundu.")
 
         cb("Kategori sitemap'leri taranıyor...")
         prog.progress(15)
