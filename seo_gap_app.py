@@ -1119,62 +1119,69 @@ if "csv_override_confirmed" not in st.session_state:
     st.session_state.csv_override_confirmed = False
 
 if run_btn and domain_input:
-    domain = domain_input.strip().replace("https://", "").replace("http://", "").strip("/")
+    try:
+        domain = domain_input.strip().replace("https://", "").replace("http://", "").strip("/")
 
-    if not category_sitemaps:
-        st.error("Kategori sitemap URL'i girilmedi. En az bir sitemap URL'i gerekli.")
-        st.stop()
+        if not category_sitemaps:
+            st.error("Kategori sitemap URL'i girilmedi. En az bir sitemap URL'i gerekli.")
+            st.stop()
 
-    product_csv_data = None
-    csv_parse_error = None
-    if product_csv_file is not None:
-        product_csv_data, csv_parse_error = parse_screaming_frog_csv(product_csv_file)
+        product_csv_data = None
+        csv_parse_error = None
+        if product_csv_file is not None:
+            product_csv_data, csv_parse_error = parse_screaming_frog_csv(product_csv_file)
 
-    if csv_parse_error and not st.session_state.csv_override_confirmed:
-        st.markdown(f"""
-        <div class="err-box">
-            ⚠️ CSV dosyası okunamadı: {csv_parse_error}<br>
-            Ürün eşleştirmesi yapılamayacak, sonuçlar daha az kesin olacak (canlı arama tahminine düşülecek).
-        </div>
-        """, unsafe_allow_html=True)
-        col_continue, col_cancel = st.columns(2)
-        with col_continue:
-            if st.button("CSV'siz devam et (arama tahmini kullan)"):
-                st.session_state.csv_override_confirmed = True
-                st.rerun()
-        with col_cancel:
-            st.button("Dur, dosyayı düzelteceğim")
-        st.stop()
+        if csv_parse_error and not st.session_state.csv_override_confirmed:
+            st.markdown(f"""
+            <div class="err-box">
+                ⚠️ CSV dosyası okunamadı: {csv_parse_error}<br>
+                Ürün eşleştirmesi yapılamayacak, sonuçlar daha az kesin olacak (canlı arama tahminine düşülecek).
+            </div>
+            """, unsafe_allow_html=True)
+            col_continue, col_cancel = st.columns(2)
+            with col_continue:
+                if st.button("CSV'siz devam et (arama tahmini kullan)"):
+                    st.session_state.csv_override_confirmed = True
+                    st.rerun()
+            with col_cancel:
+                st.button("Dur, dosyayı düzelteceğim")
+            st.stop()
 
-    st.session_state.csv_override_confirmed = False   # bir sonraki çalıştırma için sıfırla
+        st.session_state.csv_override_confirmed = False   # bir sonraki çalıştırma için sıfırla
 
-    status = st.empty()
-    prog   = st.progress(0)
-    log_lines = []
-    cb = cb_factory(log_lines, status)
+        status = st.empty()
+        prog   = st.progress(0)
+        log_lines = []
+        cb = cb_factory(log_lines, status)
 
-    if product_csv_data:
-        cb(f"Screaming Frog CSV'sinden {len(product_csv_data)} ürün başlığı okundu.")
+        if product_csv_data:
+            cb(f"Screaming Frog CSV'sinden {len(product_csv_data)} ürün başlığı okundu.")
 
-    cb("Kategori sitemap'leri taranıyor...")
-    prog.progress(15)
-    real_cats, noise_cats, products, nav_tree = fetch_site_data(
-        domain, cb, category_sitemaps=category_sitemaps, product_csv_data=product_csv_data,
-    )
-    use_search_fallback = not bool(product_csv_data)   # CSV yoksa gap analizinde canlı arama tahmini kullanılır
+        cb("Kategori sitemap'leri taranıyor...")
+        prog.progress(15)
+        real_cats, noise_cats, products, nav_tree = fetch_site_data(
+            domain, cb, category_sitemaps=category_sitemaps, product_csv_data=product_csv_data,
+        )
+        use_search_fallback = not bool(product_csv_data)   # CSV yoksa gap analizinde canlı arama tahmini kullanılır
 
-    prog.progress(55)
-    keywords = fetch_domain_keywords(domain, cb)
+        prog.progress(55)
+        keywords = fetch_domain_keywords(domain, cb)
 
-    prog.progress(80)
-    results = run_gap_analysis(keywords, real_cats, products, cb, domain=domain, use_search_fallback=use_search_fallback)
-    results.update({"categories": real_cats, "noise_categories": noise_cats,
-                     "products": products, "keywords": keywords, "domain": domain,
-                     "logs": log_lines, "nav_tree": nav_tree})
-    prog.progress(100)
+        prog.progress(80)
+        results = run_gap_analysis(keywords, real_cats, products, cb, domain=domain, use_search_fallback=use_search_fallback)
+        results.update({"categories": real_cats, "noise_categories": noise_cats,
+                         "products": products, "keywords": keywords, "domain": domain,
+                         "logs": log_lines, "nav_tree": nav_tree})
+        prog.progress(100)
 
-    status.empty(); prog.empty()
-    st.session_state.results = results
+        status.empty(); prog.empty()
+        st.session_state.results = results
+
+    except Exception as e:
+        import traceback
+        st.error(f"⚠️ Analiz sırasında bir hata oluştu: {e}")
+        with st.expander("Teknik detay (geliştirici için)"):
+            st.code(traceback.format_exc())
 
 if st.session_state.results:
     r = st.session_state.results
