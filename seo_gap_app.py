@@ -112,156 +112,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SEOGapAnalyzer/1.0)"}
 # 1. SHOPIFY — kategoriler + TÜM ürün başlıkları
 # ══════════════════════════════════════════════════════════════
 
-def detect_platform(domain, progress_cb=None):
-    for attempt in range(4):
-        try:
-            r = requests.get(f"https://{domain}/collections.json?limit=1", headers=HEADERS, timeout=10)
-            if r.status_code == 200:
-                try:
-                    if "collections" in r.json():
-                        return "shopify"
-                except Exception:
-                    pass
-                return "generic"
-            if r.status_code in (429, 503):
-                wait = 5 * (attempt + 1)   # 5s, 10s, 15s, 20s — kademeli artan bekleme
-                if progress_cb:
-                    progress_cb(f"⚠️ Rate-limit (HTTP {r.status_code}) — {wait}s bekleniyor, deneme {attempt+1}/4...")
-                time.sleep(wait)
-                continue
-            if r.status_code == 404:
-                if progress_cb:
-                    progress_cb("Shopify API bulunamadı (404) — site Shopify değil, genel tarama kullanılacak.")
-                return "generic"
-            if progress_cb:
-                progress_cb(f"⚠️ Platform tespiti HTTP {r.status_code} döndü.")
-            return "generic"
-        except Exception as e:
-            if progress_cb:
-                progress_cb(f"⚠️ Platform tespit hatası: {e}")
-            time.sleep(2)
-    if progress_cb:
-        progress_cb(
-            "⚠️ Rate-limit nedeniyle platform tespit edilemedi. "
-            "Bu genelde geçicidir — birkaç dakika bekleyip tekrar deneyin."
-        )
-    return "generic"
 
-
-def fetch_all_collections(domain, progress_cb=None):
-    collections, page = [], 1
-    consecutive_errors = 0
-    while True:
-        cols = None
-        for attempt in range(3):
-            try:
-                r = requests.get(f"https://{domain}/collections.json?limit=250&page={page}", headers=HEADERS, timeout=15)
-                if r.status_code == 429:
-                    wait = 4 * (attempt + 1)
-                    if progress_cb:
-                        progress_cb(f"⚠️ collections.json rate-limit (429) — {wait}s bekleniyor...")
-                    time.sleep(wait)
-                    continue
-                if r.status_code != 200:
-                    if progress_cb:
-                        progress_cb(f"⚠️ collections.json HTTP {r.status_code} döndü (sayfa {page}).")
-                    cols = []
-                    break
-                data = r.json()
-                cols = data.get("collections", [])
-                break
-            except Exception as e:
-                if progress_cb:
-                    progress_cb(f"⚠️ collections.json hatası: {e}")
-                cols = []
-                break
-        if cols is None:
-            cols = []
-        if not cols:
-            consecutive_errors += 1
-            if consecutive_errors >= 2 and page == 1:
-                if progress_cb:
-                    progress_cb("⚠️ İlk sayfada hiç koleksiyon bulunamadı — kategori verisi boş kalabilir.")
-            break
-        collections.extend(cols)
-        if progress_cb:
-            progress_cb(f"Koleksiyonlar çekiliyor... ({len(collections)} bulundu)")
-        if len(cols) < 250:
-            break
-        page += 1
-        time.sleep(0.3)
-    return collections
-
-
-def fetch_all_products(domain, progress_cb=None, max_pages=200):
-    products, page = [], 1
-    consecutive_errors = 0
-    while page <= max_pages:
-        retry_count = 0
-        items = None
-        while retry_count < 4:
-            try:
-                r = requests.get(f"https://{domain}/products.json?limit=250&page={page}", headers=HEADERS, timeout=20)
-                if r.status_code == 429:
-                    wait = 3 * (retry_count + 1)
-                    if progress_cb and retry_count == 0:
-                        progress_cb(f"⚠️ Rate limit (429) — {wait}s bekleniyor, tekrar denenecek...")
-                    time.sleep(wait)
-                    retry_count += 1
-                    continue
-                if r.status_code == 400:
-                    # Shopify, sayfa limitinin sonuna gelindiğinde 400 döndürür — bu normal bir bitiş sinyali
-                    items = []
-                    break
-                if r.status_code != 200:
-                    consecutive_errors += 1
-                    if progress_cb and consecutive_errors == 1:
-                        progress_cb(f"⚠️ /products.json HTTP {r.status_code} döndü (sayfa {page}).")
-                    items = []
-                    break
-                items = r.json().get("products", [])
-                consecutive_errors = 0
-                break
-            except Exception as e:
-                consecutive_errors += 1
-                if progress_cb and consecutive_errors == 1:
-                    progress_cb(f"⚠️ Ürün çekme hatası: {e}")
-                items = []
-                break
-        if items is None:
-            items = []
-        if consecutive_errors >= 5:
-            if progress_cb:
-                progress_cb("⚠️ Çok fazla ardışık hata, ürün çekme durduruldu.")
-            break
-        if not items:
-            break
-        for p in items:
-            products.append({
-                "title": p.get("title", ""),
-                "handle": p.get("handle", ""),
-            })
-        if progress_cb and page % 3 == 0:
-            progress_cb(f"Ürünler çekiliyor... ({len(products)} ürün, sayfa {page})")
-        if len(items) < 250:
-            break
-        page += 1
-        time.sleep(1.2)   # Rate limit'e çarpmamak için sayfalar arası bekleme
-    if progress_cb:
-        progress_cb(f"Toplam {len(products)} ürün çekildi.")
-    return products
-
-
-NOISE_PATTERNS = [
-    r'^\d+\s*(tl|%)', r'\btest\b', r'\bindirim\w*\b', r'\bkampanya\b',
-    r'^\d+[a-z]?$', r'\boutlet\b', r'\bdiscount\b',
-    r'^\d+\s*tl\s*(alt[ıi]|üzeri|ve)', r'^#',
-    # Mağaza / lokasyon (AVM, outlet, şube, plaza) sayfaları — ürün kategorisi değil, marka bağımsız genel kural
-    r'\bavm\b', r'\bmagaza\w*\b', r'\bmağaza\w*\b', r'\bpower outlet\b',
-    r'\boutlet center\b', r'\bmarina\b', r'\bşube\w*\b', r'\bsube\w*\b',
-    r'\bplaza\b', r'\bpark\b$', r'\bcity\b',
-]
-NOISE_RE = re.compile("|".join(NOISE_PATTERNS), re.IGNORECASE)
 
 
 def build_categories(collections, progress_cb=None):
@@ -281,44 +132,6 @@ def build_categories(collections, progress_cb=None):
         progress_cb(f"{len(real)} gerçek kategori, {len(noise)} kampanya/test/mağaza koleksiyonu ayrıldı.")
     return real, noise
 
-
-def fetch_category_product_counts(domain, categories, progress_cb=None):
-    """Her gerçek kategori için TAM ürün sayısını sayfalayarak çeker (250 üst sınırı yok)."""
-    errors = 0
-    for i, cat in enumerate(categories):
-        total, page = 0, 1
-        try:
-            while True:
-                retry_count = 0
-                r = None
-                while retry_count < 3:
-                    r = requests.get(
-                        f"https://{domain}/collections/{cat['handle']}/products.json?limit=250&page={page}",
-                        headers=HEADERS, timeout=15
-                    )
-                    if r.status_code == 429:
-                        time.sleep(2 * (retry_count + 1))
-                        retry_count += 1
-                        continue
-                    break
-                items = r.json().get("products", []) if r and r.status_code == 200 else []
-                total += len(items)
-                if len(items) < 250:
-                    break
-                page += 1
-                time.sleep(0.4)
-                if page > 20:
-                    break
-            cat["product_count"] = total
-        except Exception:
-            cat["product_count"] = 0
-            errors += 1
-        if progress_cb and i % 15 == 0:
-            progress_cb(f"Kategori ürün sayıları hesaplanıyor... ({i+1}/{len(categories)})")
-        time.sleep(0.25)
-    if progress_cb and errors:
-        progress_cb(f"⚠️ {errors} kategori için ürün sayısı çekilemedi.")
-    return categories
 
 
 # ── GENEL PLATFORM (Shopify olmayan siteler) ──────────────────
@@ -410,64 +223,6 @@ def parse_sitemap_urls(sitemap_url, progress_cb=None, _depth=0):
     return urls
 
 
-def estimate_site_size(domain, progress_cb=None, manual_category_sitemaps=None, manual_product_sitemaps=None):
-    """
-    Hızlı keşif: sitemap'i tarar, kategori/ürün URL sayısını TAHMİN eder.
-    Hiçbir sayfa içeriği çekmez — sadece sitemap XML'inden URL sayar.
-    Kullanıcıya 'tüm başlıkları çek mi / hızlı tahmin mi' seçimi sunmak için kullanılır.
-
-    manual_category_sitemaps / manual_product_sitemaps verilirse (kullanıcının
-    elle girdiği sitemap URL'leri), bu sitemap'lerdeki TÜM url'ler doğrudan o
-    türden sayılır — heuristik sınıflandırmaya hiç gerek kalmaz, çok daha
-    güvenilir sonuç verir.
-    """
-    manual_cat_urls, manual_prod_urls = [], []
-    if manual_category_sitemaps:
-        for sm in manual_category_sitemaps:
-            manual_cat_urls.extend(parse_sitemap_urls(sm, progress_cb))
-        if progress_cb:
-            progress_cb(f"Manuel kategori sitemap'lerinden {len(manual_cat_urls)} URL okundu.")
-    if manual_product_sitemaps:
-        for sm in manual_product_sitemaps:
-            manual_prod_urls.extend(parse_sitemap_urls(sm, progress_cb))
-        if progress_cb:
-            progress_cb(f"Manuel ürün sitemap'lerinden {len(manual_prod_urls)} URL okundu.")
-
-    if manual_cat_urls or manual_prod_urls:
-        # Eksik kalan tarafı (kategori VEYA ürün) otomatik taramadan tamamla
-        auto_cat_urls, auto_prod_urls = [], []
-        if not manual_cat_urls or not manual_prod_urls:
-            sitemaps = discover_sitemaps(domain, progress_cb)
-            all_urls = []
-            for sm in sitemaps:
-                all_urls.extend(parse_sitemap_urls(sm, progress_cb))
-            auto_cat_urls, auto_prod_urls, _ = classify_sitemap_urls(all_urls)
-        cat_urls  = manual_cat_urls or auto_cat_urls
-        prod_urls = manual_prod_urls or auto_prod_urls
-        return {
-            "category_count": len(cat_urls), "product_count": len(prod_urls),
-            "sitemaps_found": len(manual_category_sitemaps or []) + len(manual_product_sitemaps or []),
-            "category_urls": cat_urls, "product_urls": prod_urls,
-        }
-
-    sitemaps = discover_sitemaps(domain, progress_cb)
-    if not sitemaps:
-        return {"category_count": 0, "product_count": 0, "sitemaps_found": 0,
-                 "category_urls": [], "product_urls": []}
-    all_urls = []
-    for sm in sitemaps:
-        all_urls.extend(parse_sitemap_urls(sm, progress_cb))
-    cat_urls, prod_urls, _ = classify_sitemap_urls(all_urls)
-    if progress_cb:
-        progress_cb(f"Sitemap taraması: ~{len(cat_urls)} kategori, ~{len(prod_urls)} ürün URL'si bulundu.")
-    return {
-        "category_count": len(cat_urls),
-        "product_count": len(prod_urls),
-        "sitemaps_found": len(sitemaps),
-        "category_urls": cat_urls,
-        "product_urls": prod_urls,
-    }
-
 
 def scrape_page_title_and_count(url, progress_cb=None):
     """Bir kategori sayfasını ziyaret edip başlık + ürün sayısını (sayfadaki metinden) çıkarır."""
@@ -520,84 +275,6 @@ def fetch_generic_categories(domain, category_urls, progress_cb=None, max_catego
         time.sleep(0.15)
     return categories
 
-
-import json
-from pathlib import Path
-
-CHECKPOINT_DIR = Path("/tmp/seo_gap_checkpoints")
-CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _checkpoint_path(domain):
-    safe_name = re.sub(r"[^a-z0-9]", "_", domain.lower())
-    return CHECKPOINT_DIR / f"{safe_name}.json"
-
-
-def save_checkpoint(domain, data):
-    """İlerlemeyi diske yazar. data: {'products': [...], 'remaining_urls': [...], 'total': N, 'mode': 'full_crawl'}"""
-    try:
-        path = _checkpoint_path(domain)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-    except Exception:
-        pass   # checkpoint yazma hatası analizi durdurmamalı
-
-
-def load_checkpoint(domain):
-    path = _checkpoint_path(domain)
-    if not path.exists():
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def clear_checkpoint(domain):
-    path = _checkpoint_path(domain)
-    if path.exists():
-        try:
-            path.unlink()
-        except Exception:
-            pass
-
-
-def fetch_generic_products_full(domain, product_urls, progress_cb=None, max_products=15000,
-                                  resume_from=None, checkpoint_every=200):
-    """
-    TÜM ürün sayfalarını tek tek ziyaret edip başlık çeker. Yavaş ama tam doğru.
-    Her `checkpoint_every` üründe bir ilerleme (işlenen ürünler + kalan URL listesi)
-    diske kaydedilir; kesinti olursa `resume_from` ile kaldığı yerden devam edilebilir.
-    """
-    urls = resume_from["all_urls"] if resume_from else product_urls[:max_products]
-    products = list(resume_from["products"]) if resume_from else []
-    start_index = resume_from["next_index"] if resume_from else 0
-
-    if resume_from and progress_cb:
-        progress_cb(f"Önceki kayıttan devam ediliyor: {start_index}/{len(urls)} ürün zaten işlenmiş.")
-
-    for i in range(start_index, len(urls)):
-        url = urls[i]
-        info = scrape_product_title(url)
-        if info and info["title"]:
-            products.append(info)
-        if progress_cb and i % 25 == 0:
-            progress_cb(f"Ürün başlıkları çekiliyor... ({i+1}/{len(urls)})")
-        if (i + 1) % checkpoint_every == 0:
-            save_checkpoint(domain, {
-                "products": products, "next_index": i + 1, "total": len(urls),
-                "mode": "full_crawl", "all_urls": urls,
-            })
-        time.sleep(0.2)
-
-    clear_checkpoint(domain)   # tamamlandı, checkpoint'e gerek yok
-    if progress_cb:
-        progress_cb(f"Toplam {len(products)} ürün başlığı çekildi.")
-    return products
-
-
-SEARCH_PATH_CANDIDATES = ["/search?q=", "/arama?q=", "/search?query=", "/?s=", "/search/?q="]
 
 
 def find_working_search_path(domain, progress_cb=None):
@@ -658,20 +335,39 @@ def try_search_count(domain, query, search_path=None, progress_cb=None):
     return None
 
 
-def fetch_generic_products_via_search(domain, queries, progress_cb=None):
+
+def parse_screaming_frog_csv(uploaded_file, progress_cb=None):
     """
-    Tüm ürünleri çekmek yerine, gap adaylarının kelimelerini arama endpoint'inden
-    sorgulayıp sonuç sayısını okur. queries: aranacak kelime öbeklerinin listesi.
-    Döner: {query: result_count}
+    Screaming Frog export'undan (Address, Title 1 kolonları) ürün listesini okur.
+    Hiçbir HTTP isteği atmaz — saniyeler içinde biter.
     """
-    results = {}
-    for i, q in enumerate(queries):
-        count = try_search_count(domain, q, progress_cb)
-        results[q] = count or 0
-        if progress_cb and i % 10 == 0:
-            progress_cb(f"Arama ile ürün sayısı kontrol ediliyor... ({i+1}/{len(queries)})")
-        time.sleep(0.3)
-    return results
+    import pandas as pd
+    try:
+        df = pd.read_csv(uploaded_file)
+    except Exception as e:
+        if progress_cb:
+            progress_cb(f"⚠️ CSV okunamadı: {e}")
+        return []
+
+    # Kolon adları Screaming Frog versiyonuna göre değişebilir, esnek eşleştir
+    addr_col = next((c for c in df.columns if c.strip().lower() in ("address", "url")), None)
+    title_col = next((c for c in df.columns if c.strip().lower() in ("title 1", "title1", "title")), None)
+
+    if not addr_col or not title_col:
+        if progress_cb:
+            progress_cb(f"⚠️ CSV'de 'Address' veya 'Title 1' kolonu bulunamadı. Bulunan kolonlar: {list(df.columns)}")
+        return []
+
+    products = []
+    for _, row in df.iterrows():
+        title = str(row.get(title_col, "")).strip()
+        url = str(row.get(addr_col, "")).strip()
+        if title and title.lower() != "nan":
+            products.append({"title": title, "handle": urlparse(url).path.strip("/").split("/")[-1] if url else ""})
+
+    if progress_cb:
+        progress_cb(f"Screaming Frog CSV'sinden {len(products)} ürün başlığı okundu.")
+    return products
 
 
 def fetch_nav_tree(domain, progress_cb=None):
@@ -834,53 +530,31 @@ def top_level_groups_from_categories(categories):
     return groups
 
 
-def fetch_site_data(domain, progress_cb=None, force_shopify=False, crawl_mode="full_crawl",
-                     category_urls=None, product_urls=None):
+def fetch_site_data(domain, progress_cb=None, category_sitemaps=None, product_csv_data=None):
     """
-    crawl_mode:
-      - "full_crawl": (sadece generic platform) tüm ürün sayfalarını tek tek ziyaret eder — yavaş, en doğru
-      - "search_estimate": (sadece generic platform) ürün başlığı çekmez, gap analizinde arama
-        endpoint'i üzerinden sayım yapılacak şekilde boş ürün listesiyle devam eder
-    category_urls / product_urls: estimate_site_size'dan önceden bulunmuşsa tekrar taramamak için verilir.
+    Basitlestirilmis, hizli-yol-oncelikli veri toplama:
+
+    - category_sitemaps: kullanicinin verdigi kategori sitemap URL'leri (zorunlu girdi,
+      UI seviyesinde kontrol edilir). Bu URL'lerdeki TUM sayfalar kategori sayilir,
+      her biri ziyaret edilip baslik + urun sayisi (varsa) okunur.
+    - product_csv_data: Screaming Frog CSV'sinden onceden parse edilmis urun listesi
+      (title, handle). Verilirse hicbir urun sayfasi ziyaret edilmez - aninda hazir.
+      Verilmezse urun listesi bos doner; gap analizi canli arama ile tahmin yapar.
     """
-    platform = "shopify" if force_shopify else detect_platform(domain, progress_cb)
-
-    if platform == "shopify":
-        if progress_cb:
-            progress_cb("Platform: SHOPIFY" + (" (manuel seçildi)" if force_shopify else ""))
-        nav_tree = fetch_nav_tree(domain, progress_cb)
-        handle_to_path = flatten_nav_tree(nav_tree) if nav_tree else {}
-
-        collections = fetch_all_collections(domain, progress_cb)
-        real_cats, noise_cats = build_categories(collections, progress_cb)
-
-        for cat in real_cats:
-            path = handle_to_path.get(cat["handle"])
-            cat["nav_path"] = path or [cat["title"]]
-        if not nav_tree:
-            real_cats = build_fallback_groups(real_cats)
-            if progress_cb:
-                fb_groups = top_level_groups_from_categories(real_cats)
-                progress_cb(f"Nav menü bulunamadı, kategori isimlerinden {len(fb_groups)} grup tahmin edildi.")
-
-        real_cats = fetch_category_product_counts(domain, real_cats, progress_cb)
-        products = fetch_all_products(domain, progress_cb)
-        return real_cats, noise_cats, products, nav_tree
-
-    # ── Genel platform (Shopify değil) ──
-    if progress_cb:
-        progress_cb("Platform: GENEL (sitemap tabanlı tarama)")
-
     nav_tree = fetch_nav_tree(domain, progress_cb)
     handle_to_path = flatten_nav_tree(nav_tree) if nav_tree else {}
 
-    if category_urls is None or product_urls is None:
-        size_info = estimate_site_size(domain, progress_cb)
-        category_urls = size_info["category_urls"]
-        product_urls = size_info["product_urls"]
+    category_urls = []
+    for sm in (category_sitemaps or []):
+        category_urls.extend(parse_sitemap_urls(sm, progress_cb))
+    category_urls = list(dict.fromkeys(category_urls))
+
+    if progress_cb:
+        progress_cb(f"Kategori sitemap'lerinden {len(category_urls)} URL okundu.")
 
     raw_cats = fetch_generic_categories(domain, category_urls, progress_cb)
     real_cats, noise_cats = build_categories(raw_cats, progress_cb)
+
     for cat in real_cats:
         path = handle_to_path.get(cat["handle"])
         cat["nav_path"] = path or [cat["title"]]
@@ -888,17 +562,16 @@ def fetch_site_data(domain, progress_cb=None, force_shopify=False, crawl_mode="f
         real_cats = build_fallback_groups(real_cats)
         if progress_cb:
             fb_groups = top_level_groups_from_categories(real_cats)
-            progress_cb(f"Nav menü bulunamadı, kategori isimlerinden {len(fb_groups)} grup tahmin edildi.")
+            progress_cb(f"Nav menu bulunamadi, kategori isimlerinden {len(fb_groups)} grup tahmin edildi.")
 
-    if crawl_mode == "full_crawl":
-        resume_from = load_checkpoint(domain)
-        if resume_from and resume_from.get("mode") == "full_crawl" and progress_cb:
-            progress_cb(f"⏪ Önceki kesintiden checkpoint bulundu: {resume_from.get('next_index', 0)} ürün zaten işlenmiş.")
-        products = fetch_generic_products_full(domain, product_urls, progress_cb, resume_from=resume_from)
-    else:
-        # search_estimate modunda ürün başlıkları çekilmez; gap analizi sırasında
-        # arama endpoint'i üzerinden canlı sayım yapılır (run_gap_analysis -> search_fallback)
-        products = []
+    products = product_csv_data or []
+    if products and progress_cb:
+        progress_cb(f"{len(products)} urun basligi CSV'den hazir - hicbir sayfa ziyaret edilmeyecek.")
+
+    if products:
+        for cat in real_cats:
+            cat_tokens = _tokens(cat["title"]) | _tokens(cat["handle"])
+            cat["product_count"] = count_matching_products(cat_tokens, products)
 
     return real_cats, noise_cats, products, nav_tree
 
@@ -982,7 +655,32 @@ def _tokens(text):
     return set(_norm(text).split()) - STOP
 
 def _matches_category(keyword, cat):
-    return bool(_tokens(keyword) & (_tokens(cat["title"]) | _tokens(cat["handle"])))
+    kw_tokens = _tokens(keyword)
+    cat_tokens = _tokens(cat["title"]) | _tokens(cat["handle"])
+    return any(_stem_match(kt, ct) for kt in kw_tokens for ct in cat_tokens)
+
+def _stem_match(query_token, product_token, min_stem_len=4):
+    """
+    Türkçe sondan eklemeli yapı yüzünden ('çanta' vs 'çantası') tam kelime eşleşmesi
+    yetersiz kalır. Bunun yerine, yeterince uzun kelimelerde önek (prefix) eşleşmesine
+    bakılır — 'canta' ile 'cantasi' aynı kökten geldiği için eşleşir.
+    """
+    if query_token == product_token:
+        return True
+    if len(query_token) < min_stem_len or len(product_token) < min_stem_len:
+        return False
+    shorter, longer = sorted([query_token, product_token], key=len)
+    return longer.startswith(shorter)
+
+
+def _tokens_match(query_tokens, product_tokens):
+    """Her query token'ı için product token'larında bir stem-eşleşmesi var mı?"""
+    matched = 0
+    for qt in query_tokens:
+        if any(_stem_match(qt, pt) for pt in product_tokens):
+            matched += 1
+    return matched
+
 
 def count_matching_products(query_tokens, products):
     if not query_tokens:
@@ -990,7 +688,7 @@ def count_matching_products(query_tokens, products):
     count = 0
     for p in products:
         p_tokens = _tokens(p["title"])
-        if query_tokens & p_tokens and len(query_tokens & p_tokens) >= len(query_tokens):
+        if _tokens_match(query_tokens, p_tokens) >= len(query_tokens):
             count += 1
     return count
 
@@ -1359,31 +1057,27 @@ col_input, col_btn = st.columns([5, 1])
 with col_input:
     domain_input = st.text_input("", placeholder="derimod.com.tr", label_visibility="collapsed")
 with col_btn:
-    discover_btn = st.button("Analiz Et")
+    run_btn = st.button("Analiz Et")
 
-force_shopify = st.checkbox(
-    "Bu site Shopify (platform tespiti rate-limit'e çarparsa bunu işaretleyip tekrar deneyin)",
-    value=False,
-)
+st.caption("Kategori sitemap'i zorunlu. Urun CSV'si (Screaming Frog: Address + Title 1) verilirse "
+           "hicbir urun sayfasi taranmaz, analiz saniyeler icinde tamamlanir.")
 
-with st.expander("Gelişmiş: kategori/ürün sitemap URL'lerini manuel belirt (opsiyonel, daha hızlı ve doğru)"):
-    st.caption("Birden fazla sitemap varsa (örn. TR + EN) her satıra bir URL yazın. Boş bırakılırsa otomatik taranır.")
-    manual_category_sitemaps_raw = st.text_area(
-        "Kategori sitemap URL'leri", placeholder="https://site.com/sitemap_categories.xml\nhttps://site.com/sitemap_categories_en.xml",
-        height=80, key="manual_cat_sitemaps",
+col_cat, col_csv = st.columns(2)
+with col_cat:
+    category_sitemaps_raw = st.text_area(
+        "Kategori sitemap URL'leri (zorunlu)",
+        placeholder="https://site.com/sitemap_categories.xml\nhttps://site.com/sitemap_categories_en.xml",
+        height=90, key="category_sitemaps_input",
     )
-    manual_product_sitemaps_raw = st.text_area(
-        "Ürün sitemap URL'leri", placeholder="https://site.com/sitemap_products.xml",
-        height=80, key="manual_prod_sitemaps",
+with col_csv:
+    product_csv_file = st.file_uploader(
+        "Urun CSV'si (Screaming Frog export, opsiyonel)", type=["csv"], key="product_csv_input"
     )
 
-manual_category_sitemaps = [u.strip() for u in manual_category_sitemaps_raw.splitlines() if u.strip()]
-manual_product_sitemaps = [u.strip() for u in manual_product_sitemaps_raw.splitlines() if u.strip()]
+category_sitemaps = [u.strip() for u in category_sitemaps_raw.splitlines() if u.strip()]
 
 if "results" not in st.session_state:
     st.session_state.results = None
-if "discovery" not in st.session_state:
-    st.session_state.discovery = None
 
 def cb_factory(log_lines, status):
     def cb(msg):
@@ -1392,119 +1086,27 @@ def cb_factory(log_lines, status):
         status.markdown(html, unsafe_allow_html=True)
     return cb
 
-# ── Yarım kalmış bir tarama var mı kontrol et ──
-if domain_input:
-    _domain_check = domain_input.strip().replace("https://", "").replace("http://", "").strip("/")
-    _existing_checkpoint = load_checkpoint(_domain_check)
-    if _existing_checkpoint and st.session_state.discovery is None:
-        st.markdown(f"""
-        <div class="warn-box" style="background:#eaf1fd;border-color:#bcd4f5;color:#2a4d7a">
-            Bu domain için yarım kalmış bir tarama bulundu: <b>{_existing_checkpoint.get('next_index', 0)}/{_existing_checkpoint.get('total', '?')}</b> ürün işlenmiş.
-        </div>
-        """, unsafe_allow_html=True)
-        col_resume, col_restart = st.columns(2)
-        with col_resume:
-            if st.button("Kaldığı yerden devam et"):
-                st.session_state.discovery = {
-                    "domain": _domain_check, "platform": "generic",
-                    "crawl_mode": "full_crawl",
-                    "size_info": {"category_urls": [], "product_urls": []},
-                    "resume": True,
-                }
-                st.rerun()
-        with col_restart:
-            if st.button("Sıfırdan başlat (eskiyi sil)"):
-                clear_checkpoint(_domain_check)
-                st.rerun()
-
-# ── 1. AŞAMA: Keşif ──
-if discover_btn and domain_input:
+if run_btn and domain_input:
     domain = domain_input.strip().replace("https://", "").replace("http://", "").strip("/")
-    status = st.empty()
-    log_lines = []
-    cb = cb_factory(log_lines, status)
-
-    platform = "shopify" if force_shopify else detect_platform(domain, cb)
-
-    if platform == "shopify":
-        # Shopify hızlı API yolu kullandığı için keşif adımına gerek yok, direkt analiz başlar
-        st.session_state.discovery = {"domain": domain, "platform": "shopify", "force_shopify": force_shopify}
-    else:
-        cb("Site büyüklüğü tahmin ediliyor (sitemap taranıyor)...")
-        size_info = estimate_site_size(
-            domain, cb,
-            manual_category_sitemaps=manual_category_sitemaps or None,
-            manual_product_sitemaps=manual_product_sitemaps or None,
-        )
-        st.session_state.discovery = {
-            "domain": domain, "platform": "generic",
-            "size_info": size_info,
-        }
-    status.empty()
-
-# ── Genel platform için: kullanıcıya strateji seçimi sun ──
-disc = st.session_state.discovery
-if disc and disc.get("platform") == "generic" and "crawl_mode" not in disc:
-    size_info = disc["size_info"]
-    p_count = size_info["product_count"]
-    c_count = size_info["category_count"]
-
-    est_cat_minutes  = round((min(c_count, 150) * 0.6) / 60, 1) or 0.1   # kategori taraması her iki modda da çalışır
-    est_full_minutes = round(est_cat_minutes + (p_count * 0.5) / 60)
-    est_search_minutes = round(est_cat_minutes + 1)   # gap'ler belirlendikten sonra sadece o kelimeler aranır
-
-    st.markdown(f"""
-    <div class="warn-box" style="background:#eaf1fd;border-color:#bcd4f5;color:#2a4d7a">
-        Sitemap'te yaklaşık <b>{c_count} kategori</b> ve <b>{p_count:,} ürün</b> URL'si bulundu.
-        {"İlk 150 kategori taranacak. " if c_count > 150 else ""}Nasıl ilerleyelim?
-    </div>
-    """, unsafe_allow_html=True)
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown(f"**Tüm ürün başlıklarını çek**  \nEn doğru sonuç. Tahmini süre: ~{est_full_minutes} dakika.")
-        if st.button("Bu yöntemle ilerle", key="full_crawl_btn"):
-            disc["crawl_mode"] = "full_crawl"
-            st.rerun()
-    with col_b:
-        st.markdown(f"**Arama endpoint'i ile hızlı tahmin**  \nDaha az kesin ama çok daha hızlı. Tahmini süre: ~{est_search_minutes} dakika.")
-        if st.button("Bu yöntemle ilerle", key="search_estimate_btn"):
-            disc["crawl_mode"] = "search_estimate"
-            st.rerun()
-
-# ── 2. AŞAMA: Asıl analiz ──
-ready_shopify = disc and disc.get("platform") == "shopify"
-ready_generic = disc and disc.get("platform") == "generic" and "crawl_mode" in disc
-
-if ready_shopify or ready_generic:
-    domain = disc["domain"]
     status = st.empty()
     prog   = st.progress(0)
     log_lines = []
     cb = cb_factory(log_lines, status)
 
-    cb("Site verisi çekiliyor (büyük sitelerde birkaç dakika sürebilir)...")
-    prog.progress(5)
+    if not category_sitemaps:
+        st.error("Kategori sitemap URL'i girilmedi. En az bir sitemap URL'i gerekli.")
+        st.stop()
 
-    if ready_shopify:
-        real_cats, noise_cats, products, nav_tree = fetch_site_data(
-            domain, cb, force_shopify=disc.get("force_shopify", False)
-        )
-        use_search_fallback = False
-    else:
-        size_info = disc["size_info"]
-        if disc.get("resume") and not size_info.get("category_urls"):
-            cb("Kategori/ürün URL listesi yeniden taranıyor (resume için gerekli)...")
-            size_info = estimate_site_size(
-                domain, cb,
-                manual_category_sitemaps=manual_category_sitemaps or None,
-                manual_product_sitemaps=manual_product_sitemaps or None,
-            )
-        real_cats, noise_cats, products, nav_tree = fetch_site_data(
-            domain, cb, crawl_mode=disc["crawl_mode"],
-            category_urls=size_info["category_urls"], product_urls=size_info["product_urls"],
-        )
-        use_search_fallback = (disc["crawl_mode"] == "search_estimate")
+    product_csv_data = None
+    if product_csv_file is not None:
+        product_csv_data = parse_screaming_frog_csv(product_csv_file, cb)
+
+    cb("Kategori sitemap'leri taranıyor...")
+    prog.progress(15)
+    real_cats, noise_cats, products, nav_tree = fetch_site_data(
+        domain, cb, category_sitemaps=category_sitemaps, product_csv_data=product_csv_data,
+    )
+    use_search_fallback = not bool(product_csv_data)   # CSV yoksa gap analizinde canlı arama tahmini kullanılır
 
     prog.progress(55)
     keywords = fetch_domain_keywords(domain, cb)
@@ -1517,8 +1119,6 @@ if ready_shopify or ready_generic:
     prog.progress(100)
 
     status.empty(); prog.empty()
-    st.session_state.results = results
-    st.session_state.discovery = None   # bir sonraki analiz için sıfırla
     st.session_state.results = results
 
 if st.session_state.results:
