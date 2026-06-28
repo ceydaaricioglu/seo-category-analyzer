@@ -111,10 +111,19 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SEOGapAnalyzer/1.0)"}
 
 
 # ══════════════════════════════════════════════════════════════
-# 1. SHOPIFY — kategoriler + TÜM ürün başlıkları
+# 1. KATEGORİ FİLTRELEME
 # ══════════════════════════════════════════════════════════════
 
-
+NOISE_PATTERNS = [
+    r'^\d+\s*(tl|%)', r'\btest\b', r'\bindirim\w*\b', r'\bkampanya\b',
+    r'^\d+[a-z]?$', r'\boutlet\b', r'\bdiscount\b',
+    r'^\d+\s*tl\s*(alt[ıi]|üzeri|ve)', r'^#',
+    # Mağaza / lokasyon (AVM, outlet, şube, plaza) sayfaları — ürün kategorisi değil, marka bağımsız genel kural
+    r'\bavm\b', r'\bmagaza\w*\b', r'\bmağaza\w*\b', r'\bpower outlet\b',
+    r'\boutlet center\b', r'\bmarina\b', r'\bşube\w*\b', r'\bsube\w*\b',
+    r'\bplaza\b', r'\bpark\b$', r'\bcity\b',
+]
+NOISE_RE = re.compile("|".join(NOISE_PATTERNS), re.IGNORECASE)
 
 
 def build_categories(collections, progress_cb=None):
@@ -277,6 +286,9 @@ def fetch_generic_categories(domain, category_urls, progress_cb=None, max_catego
         time.sleep(0.15)
     return categories
 
+
+
+SEARCH_PATH_CANDIDATES = ["/search?q=", "/arama?q=", "/search?query=", "/?s=", "/search/?q="]
 
 
 def find_working_search_path(domain, progress_cb=None):
