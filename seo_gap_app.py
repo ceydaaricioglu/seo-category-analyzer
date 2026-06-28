@@ -1116,6 +1116,19 @@ with col_csv:
     product_csv_file = st.file_uploader(
         "Urun CSV'si (Screaming Frog export, opsiyonel)", type=["csv"], key="product_csv_input"
     )
+    if product_csv_file is not None:
+        st.caption(f"✓ Dosya hazır: {product_csv_file.name} ({product_csv_file.size:,} byte)")
+        # Dosya yüklenir yüklenmez hemen parse et (butona basılma anına bağlı kalmadan) —
+        # böylece widget/buton zamanlama sorunlarından etkilenmez.
+        if st.session_state.get("_csv_cache_name") != product_csv_file.name:
+            _parsed, _err = parse_screaming_frog_csv(product_csv_file)
+            st.session_state["_csv_cache_name"] = product_csv_file.name
+            st.session_state["_csv_cache_data"] = _parsed
+            st.session_state["_csv_cache_error"] = _err
+        if st.session_state.get("_csv_cache_error"):
+            st.warning(f"CSV okunamadı: {st.session_state['_csv_cache_error']}")
+        else:
+            st.caption(f"✓ {len(st.session_state.get('_csv_cache_data', []))} ürün başlığı önceden okundu.")
 
 category_sitemaps = [u.strip() for u in category_sitemaps_raw.splitlines() if u.strip()]
 
@@ -1145,12 +1158,11 @@ if run_btn and domain_input:
         log_lines = []
         cb = cb_factory(log_lines, status)
 
-        product_csv_data = None
-        csv_parse_error = None
-        if product_csv_file is not None:
-            cb(f"CSV dosyası alındı: {product_csv_file.name} ({product_csv_file.size} byte). Okunuyor...")
-            product_csv_data, csv_parse_error = parse_screaming_frog_csv(product_csv_file, cb)
-        else:
+        product_csv_data = st.session_state.get("_csv_cache_data")
+        csv_parse_error = st.session_state.get("_csv_cache_error")
+        if product_csv_data:
+            cb(f"CSV önbellekten kullanılıyor: {len(product_csv_data)} ürün başlığı.")
+        elif product_csv_file is None:
             cb("⚠️ Ürün CSV'si yüklenmedi — gap analizi canlı arama tahminiyle yapılacak (daha az kesin).")
 
         if csv_parse_error and not st.session_state.csv_override_confirmed:
